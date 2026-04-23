@@ -23,6 +23,7 @@
  * */
 #include "dump_queue.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "thread/cpu_affinity.h"
 
 namespace UC::CacheStore {
@@ -40,6 +41,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     buffer_ = buffer;
     backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
+    shardSize_ = config.shardSize;
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.streamNumber;
     cpuAffinityCores_ = config.cpuAffinityCores;
@@ -128,6 +130,8 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     }
     auto tpSyncStream = NowTime::Now();
     for (auto& handle : dumpCtx.bufferHandles) { handle.MarkReady(); }
+    dumpCtx.backendBytes = backendTaskDesc.size() * shardSize_;
+    dumpCtx.backendStartTp = NowTime::Now();
     auto res = backend_->Dump(std::move(backendTaskDesc));
     if (!res) [[unlikely]] {
         UC_ERROR("Failed({}) to submit dump task({}) to backend.", res.Error(), task->id);
@@ -174,6 +178,12 @@ void DumpQueue::BackendDumpStage()
                 UC_ERROR("Failed({}) to wait backend({}) for task({}).", s, task.backendTaskHandle,
                          task.taskHandle);
                 return;
+            }
+            auto backendCost = NowTime::Now() - task.backendStartTp;
+            if (backendCost > 0) {
+                UC::Metrics::UpdateStats(
+                    "cache_store_backend_dump_bandwidth",
+                    static_cast<double>(task.backendBytes) / backendCost / 1024 / 1024 / 1024);
             }
         }
     });

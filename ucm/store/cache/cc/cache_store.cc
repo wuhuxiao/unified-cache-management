@@ -24,6 +24,8 @@
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
+#include "time/stopwatch.h"
 #include "trans_manager.h"
 
 namespace UC::CacheStore {
@@ -58,13 +60,18 @@ public:
     std::string Readme() const override { return "CacheStore"; }
     Expected<std::vector<uint8_t>> Lookup(const Detail::BlockId* blocks, size_t num) override
     {
+        StopWatch sw;
         auto res = bufferMgr_.Lookup(blocks, num);
+        UC::Metrics::UpdateStats("cache_store_lookup_duration", sw.Elapsed().count() * 1e3);
         if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
         return res;
     }
     Expected<ssize_t> LookupOnPrefix(const Detail::BlockId* blocks, size_t num) override
     {
+        StopWatch sw;
         auto res = bufferMgr_.LookupOnPrefix(blocks, num);
+        UC::Metrics::UpdateStats("cache_store_lookup_on_prefix_duration",
+                                 sw.Elapsed().count() * 1e3);
         if (!res) [[unlikely]] { UC_ERROR("Failed({}) to lookup blocks({}).", res.Error(), num); }
         return res;
     }

@@ -23,6 +23,7 @@
  * */
 #include "load_queue.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "thread/cpu_affinity.h"
 
 namespace UC::CacheStore {
@@ -40,6 +41,7 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     buffer_ = buffer;
     backend_ = config.storeBackend;
     deviceId_ = config.deviceId;
+    shardSize_ = config.shardSize;
     tensorSizes_ = config.tensorSizes;
     streamNumber_ = config.streamNumber;
     cpuAffinityCores_ = config.cpuAffinityCores;
@@ -93,6 +95,8 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                 Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
             };
             backendTask.brief = "Backend2Cache";
+            shardTask.backendBytes = shardSize_;
+            shardTask.backendStartTp = NowTime::Now();
             auto res = backend_->Load(std::move(backendTask));
             if (!res) [[unlikely]] {
                 UC_ERROR("Failed({}) to submit load task({}) to backend.", res.Error(), task->id);
@@ -164,6 +168,12 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
             UC_ERROR("Failed({}) to wait backend({}) for task({}).", s, task.backendTaskHandle,
                      task.taskHandle);
             return s;
+        }
+        auto backendCost = NowTime::Now() - task.backendStartTp;
+        if (backendCost > 0) {
+            UC::Metrics::UpdateStats("cache_store_backend_load_bandwidth",
+                                     static_cast<double>(task.backendBytes) / backendCost / 1024 /
+                                         1024 / 1024);
         }
         task.bufferHandle.MarkReady();
         return Status::OK();

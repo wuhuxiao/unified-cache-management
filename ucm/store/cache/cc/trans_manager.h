@@ -27,6 +27,7 @@
 #include "dump_queue.h"
 #include "load_queue.h"
 #include "logger/logger.h"
+#include "metrics_api.h"
 #include "template/task_wrapper.h"
 #include "trans_task.h"
 
@@ -55,9 +56,16 @@ protected:
         const auto num = t->desc.size();
         const auto size = shardSize_ * num;
         const auto tp = w->startTp;
+        const auto type = t->type;
         UC_DEBUG("Cache task({},{},{},{}) dispatching.", id, brief, num, size);
-        w->SetEpilog([id, brief = std::move(brief), num, size, tp] {
+        w->SetEpilog([id, brief = std::move(brief), num, size, tp, type] {
             auto cost = NowTime::Now() - tp;
+            auto metricName = type == TransTask::Type::LOAD ? "cache_store_load_bandwidth"
+                                                            : "cache_store_dump_bandwidth";
+            if (cost > 0) {
+                UC::Metrics::UpdateStats(metricName,
+                                         static_cast<double>(size) / cost / 1024 / 1024 / 1024);
+            }
             UC_DEBUG("Cache task({},{},{},{}) finished, cost {:.3f}ms.", id, brief, num, size,
                      cost * 1e3);
         });

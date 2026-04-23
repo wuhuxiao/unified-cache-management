@@ -146,7 +146,7 @@ Navigate to `http://<your-host>:3000`. Log in with the default username (`admin`
 
 4. Click **Import** to complete the import.
 
-You should now be able to see the UCM monitoring dashboard with real-time visualization of all 9 metrics.
+You should now be able to see the UCM monitoring dashboard with real-time visualization of all configured metrics.
 
 ## Available Metrics
 
@@ -166,6 +166,13 @@ UCM exposes various metrics to monitor its performance. The following table list
 | `ucm:save_speed` | Histogram | Speed of saving to UCM (GB/s) |
 | **Lookup Hit Rate Metrics** | | |
 | `ucm:interval_lookup_hit_rates` | Histogram | Hit rate of UCM lookup requests |
+| **Cache Store Metrics** | | |
+| `ucm:cache_store_lookup_duration` | Histogram | Time for cache store lookup calls (milliseconds) |
+| `ucm:cache_store_lookup_on_prefix_duration` | Histogram | Time for cache store prefix lookup calls (milliseconds) |
+| `ucm:cache_store_load_bandwidth` | Histogram | Bandwidth for cache store load tasks (GB/s) |
+| `ucm:cache_store_dump_bandwidth` | Histogram | Bandwidth for cache store dump tasks (GB/s) |
+| `ucm:cache_store_backend_load_bandwidth` | Histogram | Bandwidth for cache store backend load tasks (GB/s) |
+| `ucm:cache_store_backend_dump_bandwidth` | Histogram | Bandwidth for cache store backend dump tasks (GB/s) |
 
 ## Prometheus Configuration
 

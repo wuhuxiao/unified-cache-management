@@ -46,6 +46,8 @@ class LoadQueue {
         Detail::Shard shard;
         TransBuffer::Handle bufferHandle;
         Detail::TaskHandle backendTaskHandle;
+        size_t backendBytes{0};
+        double backendStartTp{0};
         WaiterPtr waiter;
     };
 
@@ -55,6 +57,7 @@ private:
     TransBuffer* buffer_{nullptr};
     StoreV1* backend_{nullptr};
     int32_t deviceId_{-1};
+    size_t shardSize_{0};
     std::vector<size_t> tensorSizes_{};
     size_t streamNumber_{1};
     std::vector<ssize_t> cpuAffinityCores_{};

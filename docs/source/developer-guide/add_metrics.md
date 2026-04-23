@@ -104,7 +104,7 @@ See more detailed example in [test case](https://github.com/ModelEngine-Group/un
 :sync: cc
 
 **Example:** UCM supports custom metrics by following steps:
-- Step 1: linking the static library metrics
+- Step 1: linking the metrics library
    ```c++
     target_link_libraries(xxxstore PUBLIC storeinfra metrics)
     ```
