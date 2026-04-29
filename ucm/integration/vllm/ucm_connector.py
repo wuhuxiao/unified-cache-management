@@ -3,10 +3,11 @@ import hashlib
 import math
 import os
 import pickle
+import re
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.utils import get_pp_indices
@@ -171,6 +173,175 @@ class KVCacheLayout:
         return int(self.tensor_size_lists.sum())
 
 
+class DeepSeekV4GroupKVCacheLayout:
+    """Flat pointer layout for one DeepSeek V4 KV cache group.
+
+    DeepSeek V4 registers several cache views per transformer layer. The views
+    belonging to one hybrid KV group are not necessarily contiguous by layer id,
+    so this layout flattens all registered tensors in a deterministic order.
+    """
+
+    def __init__(self, kvcaches: dict[str, torch.Tensor]) -> None:
+        self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
+        self.base_ptrs: np.ndarray
+        self.block_strides: np.ndarray
+        self.tensor_size_lists: np.ndarray
+        self._build_layout()
+
+    @staticmethod
+    def _sort_key(item: tuple[str, torch.Tensor]) -> tuple[int, str]:
+        name, _ = item
+        return (extract_layer_index(name), name)
+
+    def _build_layout(self) -> None:
+        ptrs: list[int] = []
+        strides: list[int] = []
+        tensor_sizes: list[int] = []
+
+        def handle_tensor(t: torch.Tensor, size_dims: Sequence[int]) -> None:
+            ptrs.append(t[0].data_ptr())
+            strides.append(t.stride(0) * t.element_size())
+            tensor_size = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
+            tensor_sizes.append(tensor_size)
+
+        for layer_name, kv_layer in self.kvcaches.items():
+            if isinstance(kv_layer, torch.Tensor):
+                if kv_layer.dim() == 5:
+                    # [2, num_blocks, block_size, num_head, head_dim]
+                    handle_tensor(kv_layer[0], (-3, -2, -1))
+                    handle_tensor(kv_layer[1], (-3, -2, -1))
+                elif kv_layer.dim() == 3:
+                    # [num_blocks, block_size, head_dim]
+                    handle_tensor(kv_layer, (-2, -1))
+                else:
+                    raise ValueError(
+                        f"Unsupported DeepSeek V4 kv cache tensor shape for "
+                        f"{layer_name}: {kv_layer.shape}"
+                    )
+            elif isinstance(kv_layer, Tuple):
+                for tensor in kv_layer:
+                    if tensor.dim() == 4:
+                        handle_tensor(tensor, (-3, -2, -1))
+                    elif tensor.dim() == 3:
+                        handle_tensor(tensor, (-2, -1))
+                    else:
+                        raise ValueError(
+                            f"Unsupported DeepSeek V4 tuple tensor shape for "
+                            f"{layer_name}: {tensor.shape}"
+                        )
+            else:
+                raise TypeError(
+                    f"Unsupported DeepSeek V4 kv cache type for "
+                    f"{layer_name}: {type(kv_layer)}"
+                )
+
+        if not ptrs:
+            raise ValueError("DeepSeek V4 KV cache group layout is empty.")
+
+        self.base_ptrs = np.asarray(ptrs, dtype=np.uint64)
+        self.block_strides = np.asarray(strides, dtype=np.uint64)
+        self.tensor_size_lists = np.asarray(tensor_sizes, dtype=np.uint64)
+        logger.info(
+            f"DeepSeek V4 group layout: views={len(self.kvcaches)}, "
+            f"ptrs={len(ptrs)}, block_size={self.block_size}"
+        )
+
+    def extract_block_addrs(self, vllm_block_ids: list[int]) -> np.ndarray:
+        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
+        return (
+            vllm_block_ids_np[:, None] * self.block_strides[None, :]
+            + self.base_ptrs[None, :]
+        )
+
+    def extract_block_tensor_views(self, vllm_block_ids: list[int]) -> list[torch.Tensor]:
+        tensors: list[torch.Tensor] = []
+
+        def add_views(tensor: torch.Tensor, block_id: int) -> None:
+            tensors.append(tensor[block_id])
+
+        for block_id in vllm_block_ids:
+            for layer_name, kv_layer in self.kvcaches.items():
+                if isinstance(kv_layer, torch.Tensor):
+                    if kv_layer.dim() == 5:
+                        add_views(kv_layer[0], block_id)
+                        add_views(kv_layer[1], block_id)
+                    elif kv_layer.dim() == 3:
+                        add_views(kv_layer, block_id)
+                    else:
+                        raise ValueError(
+                            f"Unsupported DeepSeek V4 kv cache tensor shape for "
+                            f"{layer_name}: {kv_layer.shape}"
+                        )
+                elif isinstance(kv_layer, Tuple):
+                    for tensor in kv_layer:
+                        add_views(tensor, block_id)
+                else:
+                    raise TypeError(
+                        f"Unsupported DeepSeek V4 kv cache type for "
+                        f"{layer_name}: {type(kv_layer)}"
+                    )
+        return tensors
+
+    def extract_block_tensors(self, vllm_block_ids: list[int]) -> list[dict]:
+        block_ids = torch.tensor(vllm_block_ids, dtype=torch.long)
+        entries: list[dict] = []
+
+        def add_entry(
+            layer_name: str,
+            view_name: str,
+            tensor: torch.Tensor,
+        ) -> None:
+            selected = tensor.index_select(0, block_ids.to(tensor.device))
+            entries.append(
+                {
+                    "layer_name": layer_name,
+                    "view_name": view_name,
+                    "source_shape": tuple(tensor.shape),
+                    "source_stride": tuple(tensor.stride()),
+                    "dtype": str(tensor.dtype),
+                    "block_ids": list(vllm_block_ids),
+                    "block_stride_bytes": tensor.stride(0) * tensor.element_size(),
+                    "block_nbytes": selected[0].numel() * selected.element_size(),
+                    "block_contiguous": tensor[0].is_contiguous(),
+                    "data": selected.detach().cpu().clone(),
+                }
+            )
+
+        for layer_name, kv_layer in self.kvcaches.items():
+            if isinstance(kv_layer, torch.Tensor):
+                if kv_layer.dim() == 5:
+                    add_entry(layer_name, "k", kv_layer[0])
+                    add_entry(layer_name, "v", kv_layer[1])
+                elif kv_layer.dim() == 3:
+                    add_entry(layer_name, "state", kv_layer)
+                else:
+                    raise ValueError(
+                        f"Unsupported DeepSeek V4 kv cache tensor shape for "
+                        f"{layer_name}: {kv_layer.shape}"
+                    )
+            elif isinstance(kv_layer, Tuple):
+                for view_idx, tensor in enumerate(kv_layer):
+                    add_entry(layer_name, f"tuple_{view_idx}", tensor)
+            else:
+                raise TypeError(
+                    f"Unsupported DeepSeek V4 kv cache type for "
+                    f"{layer_name}: {type(kv_layer)}"
+                )
+        return entries
+
+    @property
+    def tensor_size_list(self) -> list[int]:
+        return self.tensor_size_lists.tolist()
+
+    @property
+    def shard_size(self) -> int:
+        return int(self.tensor_size_lists.sum())
+
+    @property
+    def block_size(self) -> int:
+        return self.shard_size
+
+
 @dataclass
 class UCMConnectorMetadata(KVConnectorMetadata):
     request_meta: dict[str, RequestDispatchMeta] = field(default_factory=dict)
@@ -253,11 +424,13 @@ class UCMDirectConnector(KVConnectorBase_V1):
         self.chunk_size = self.block_size
         self.blocks_per_chunk = self.chunk_size // self.block_size
 
+        defer_scheduler_store = getattr(self, "_defer_scheduler_store", False)
         if role == KVConnectorRole.SCHEDULER:
             self.request_hasher = RequestHasher(vllm_config, 0)
             self._seed = self.request_hasher("UCM_HASH_SEED")
             # init scheduler-size connector
-            self.store = self._create_store(None)
+            if not defer_scheduler_store:
+                self.store = self._create_store(None)
         else:
             self.request_hasher = RequestHasher(
                 vllm_config, self.tp_rank % self.tp_size
@@ -1139,7 +1312,1189 @@ class UCMLiteConnector(UCMDirectConnector):
         return 0, False
 
 
-class UCMConnector(KVConnectorBase_V1):
+DeepSeekV4PackedRow = tuple[list[int], ...]
+DeepSeekV4PackedRows = list[DeepSeekV4PackedRow]
+
+
+@dataclass
+class DeepSeekV4RequestMeta:
+    ucm_block_ids: list[bytes] = field(default_factory=list)
+    hbm_hit_block_num: int = 0
+    total_hit_block_num: int = 0
+    num_token_ids: int = 0
+    token_processed: int = 0
+    packed_block_ids: dict[int, DeepSeekV4PackedRow] = field(default_factory=dict)
+
+
+@dataclass
+class DeepSeekV4RequestDispatchMeta:
+    load_block_ids: tuple[list[bytes], DeepSeekV4PackedRows]
+    dump_block_ids: tuple[list[bytes], DeepSeekV4PackedRows]
+
+
+@dataclass
+class UCMDeepSeekV4ConnectorMetadata(KVConnectorMetadata):
+    request_meta: dict[str, DeepSeekV4RequestDispatchMeta] = field(
+        default_factory=dict
+    )
+
+
+@dataclass
+class DeepSeekV4LoadTask:
+    request_id: str
+    label: str
+    store: UcmKVStoreBaseV1
+    task: Task
+    keys: list[bytes]
+    packed_group_block_ids: DeepSeekV4PackedRows
+    ptrs: np.ndarray
+    capture_payload: bool
+    byte_count: int
+
+
+@dataclass
+class DeepSeekV4DumpTask:
+    label: str
+    store: UcmKVStoreBaseV1
+    task: Task
+    key_count: int
+    byte_count: int
+
+
+class UCMDeepSeekV4Connector(UCMDirectConnector):
+    """UCM connector for DeepSeek V4 hybrid KV cache groups.
+
+    DeepSeek V4 uses five KV cache groups with different block sizes. This
+    connector stores one 256-token prefix block as one CacheStore block. Each
+    stored block packs the full group-0 cache for that prefix block plus the
+    group-1/2/3/4 tail blocks needed to reuse the prefix boundary.
+    """
+
+    GROUP_BLOCK_SIZES = (256, 64, 64, 4, 8)
+    # Conservative HBM-aligned tails for real allocated blocks:
+    # - SWA exposes only the previous 128-token window at a 256-token boundary.
+    # - C4A state carries the previous 8-token state window.
+    # - C128 state carries the previous 128-token state window.
+    GROUP_TAIL_BLOCKS = (None, 2, 2, 2, 16)
+    HASH_BLOCK_SIZE = 256
+
+    def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
+        self._defer_scheduler_store = True
+        super().__init__(vllm_config, role)
+        self.hash_block_size = self.HASH_BLOCK_SIZE
+        self.block_size = self.HASH_BLOCK_SIZE
+        self.group_layouts: dict[int, DeepSeekV4GroupKVCacheLayout] = {}
+        self._packed_scratch_views: dict[tuple[int, int], list[torch.Tensor]] = {}
+        self.group0_store: Optional[UcmKVStoreBaseV1] = None
+        self.requests_meta: dict[str, DeepSeekV4RequestMeta] = {}
+        if role == KVConnectorRole.SCHEDULER:
+            self.store = self._create_packed_store(None)
+            self.group0_store = self._create_group0_store(None)
+        logger.info("Init UCMDeepSeekV4Connector.")
+
+    def _create_packed_store(
+        self,
+        group_layouts: Optional[dict[int, DeepSeekV4GroupKVCacheLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        tensor_size_list = None
+        if self._role == KVConnectorRole.WORKER:
+            if group_layouts is None:
+                raise RuntimeError("Worker DeepSeek V4 packed store needs layouts.")
+            tensor_size_list = self._packed_tensor_size_list(group_layouts)
+        return self._create_deepseek_store(
+            "packed",
+            "packed",
+            tensor_size_list,
+            cpu_affinity_cores,
+        )
+
+    def _create_group0_store(
+        self,
+        group_layouts: Optional[dict[int, DeepSeekV4GroupKVCacheLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        tensor_size_list = None
+        if self._role == KVConnectorRole.WORKER:
+            if group_layouts is None:
+                raise RuntimeError("Worker DeepSeek V4 group0 store needs layouts.")
+            group0_layout = group_layouts.get(0)
+            if group0_layout is None:
+                raise RuntimeError("Worker DeepSeek V4 group0 layout is missing.")
+            tensor_size_list = group0_layout.tensor_size_list
+        return self._create_deepseek_store(
+            "group0",
+            "group0",
+            tensor_size_list,
+            cpu_affinity_cores,
+        )
+
+    def _base_store_config(
+        self,
+        store_suffix: str,
+    ) -> tuple[str, Optional[str], dict[str, object]]:
+        if len(self.connector_configs) != 1:
+            raise RuntimeError(
+                f"Expected exactly one connector config, "
+                f"but got {len(self.connector_configs)}: "
+                f"{self.connector_configs}"
+            )
+
+        name = self.connector_configs[0]["ucm_connector_name"]
+        module_path = self.connector_configs[0].get("ucm_connector_module_path", None)
+        config = copy.deepcopy(self.connector_configs[0]["ucm_connector_config"])
+        config.setdefault("store_pipeline", "Cache|Empty")
+        config.setdefault("share_buffer_enable", True)
+        if isinstance(config.get("storage_backends"), str):
+            config["storage_backends"] = [
+                path for path in config["storage_backends"].split(":")
+            ]
+        config["unique_id"] = f"{self.engine_id}_dsv4_{store_suffix}"
+        dp_rank = self._vllm_config.parallel_config.data_parallel_rank
+        config["posix_gc_enable"] = (
+            self._role != KVConnectorRole.WORKER and dp_rank == 0
+        )
+        return name, module_path, config
+
+    def _create_deepseek_store(
+        self,
+        label: str,
+        store_suffix: str,
+        tensor_size_list: Optional[list[int]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        name, module_path, config = self._base_store_config(store_suffix)
+        if self._role == KVConnectorRole.WORKER:
+            if tensor_size_list is None:
+                raise RuntimeError(
+                    f"Worker DeepSeek V4 {label} store needs tensor sizes."
+                )
+            config["device_id"] = self.local_rank
+            config["tensor_size_list"] = tensor_size_list
+            config["shard_size"] = int(sum(tensor_size_list))
+            config["block_size"] = int(sum(tensor_size_list))
+            config["local_rank_size"] = 1
+            if cpu_affinity_cores:
+                config["cpu_affinity_cores"] = list(cpu_affinity_cores)
+        logger.info(
+            f"create DeepSeek V4 {label} {name} with config: "
+            f"{self._summarize_store_config(config)}"
+        )
+        return UcmConnectorFactoryV1.create_connector(name, config, module_path)
+
+    @staticmethod
+    def _summarize_store_config(config: dict[str, object]) -> dict[str, object]:
+        summary = dict(config)
+        tensor_size_list = summary.pop("tensor_size_list", None)
+        if tensor_size_list is not None:
+            tensor_sizes = [int(size) for size in tensor_size_list]
+            summary["tensor_count"] = len(tensor_sizes)
+            summary["tensor_bytes"] = sum(tensor_sizes)
+        return summary
+
+    @staticmethod
+    def _is_group0_name(name: str) -> bool:
+        return name.endswith(".attn") or name.endswith(".attn.indexer.k_cache")
+
+    @staticmethod
+    def _is_swa_name(name: str) -> bool:
+        return name.endswith(".attn.swa_cache")
+
+    @staticmethod
+    def _is_group3_name(name: str) -> bool:
+        return name.endswith(".attn.indexer.compressor.state_cache")
+
+    @staticmethod
+    def _is_group4_name(name: str) -> bool:
+        return (
+            name.endswith(".attn.compressor.state_cache")
+            and ".indexer." not in name
+        )
+
+    def _split_kv_caches_by_group(
+        self, kv_caches: dict[str, torch.Tensor]
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        ordered = dict(
+            sorted(
+                kv_caches.items(),
+                key=lambda item: (extract_layer_index(item[0]), item[0]),
+            )
+        )
+        groups: dict[int, dict[str, torch.Tensor]] = {i: {} for i in range(5)}
+        swa_items: list[tuple[str, torch.Tensor]] = []
+        for name, value in ordered.items():
+            if self._is_group3_name(name):
+                groups[3][name] = value
+            elif self._is_group4_name(name):
+                groups[4][name] = value
+            elif self._is_swa_name(name):
+                swa_items.append((name, value))
+            elif self._is_group0_name(name):
+                groups[0][name] = value
+
+        # vLLM splits DeepSeek V4 SWA groups in an interleaved fashion.
+        groups[1].update(dict(swa_items[0::2]))
+        groups[2].update(dict(swa_items[1::2]))
+        return groups
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        self.kv_caches = kv_caches
+        self.device = create_device()
+
+        enable_affinity = os.getenv("VLLM_CPU_AFFINITY") == "1"
+        worker_cores, store_cores = (
+            self.device.split_cores(self.local_rank)
+            if enable_affinity
+            else (None, None)
+        )
+
+        grouped = self._split_kv_caches_by_group(kv_caches)
+        for group_id, group_caches in grouped.items():
+            if not group_caches:
+                logger.warning(f"DeepSeek V4 KV cache group {group_id} is empty.")
+                continue
+            layout = DeepSeekV4GroupKVCacheLayout(group_caches)
+            self.group_layouts[group_id] = layout
+
+        self.store = self._create_packed_store(self.group_layouts, store_cores)
+        self.group0_store = self._create_group0_store(
+            self.group_layouts,
+            store_cores,
+        )
+
+        if worker_cores:
+            try:
+                os.sched_setaffinity(0, worker_cores)
+                logger.info(f"[VLLM CPU Affinity] Worker bound to cores {worker_cores}")
+            except Exception as e:
+                logger.warning(f"Failed to bind worker: {e}")
+
+    def _packed_key(self, canonical_hash: bytes) -> bytes:
+        return self.request_hasher((b"deepseek_v4_packed", canonical_hash))
+
+    def _local_stub_enabled(self) -> bool:
+        return os.getenv("UCM_DEEPSEEK_V4_LOCAL_STUB", "0") == "1"
+
+    def _local_stub_dir(self) -> str:
+        stub_dir = os.getenv(
+            "UCM_DEEPSEEK_V4_LOCAL_STUB_DIR",
+            os.path.join(os.getcwd(), "deepseek_v4_ucm_stub"),
+        )
+        os.makedirs(stub_dir, exist_ok=True)
+        return stub_dir
+
+    def _local_stub_path(self, key: bytes) -> str:
+        return os.path.join(self._local_stub_dir(), f"{key.hex()}.pt")
+
+    def _local_stub_lookup_on_prefix(self, keys: list[bytes]) -> int:
+        for idx, key in enumerate(keys):
+            if not os.path.exists(self._local_stub_path(key)):
+                return idx - 1
+        return len(keys) - 1
+
+    def _packed_tensor_size_list(
+        self, group_layouts: dict[int, DeepSeekV4GroupKVCacheLayout]
+    ) -> list[int]:
+        tensor_size_list: list[int] = []
+        for group_id in range(len(self.GROUP_BLOCK_SIZES)):
+            layout = group_layouts.get(group_id)
+            if layout is None:
+                continue
+            repeat = 1 if group_id == 0 else self.GROUP_TAIL_BLOCKS[group_id]
+            assert repeat is not None
+            tensor_size_list.extend(layout.tensor_size_list * repeat)
+        return tensor_size_list
+
+    @staticmethod
+    def _group0_only_rows(
+        packed_group_block_ids: DeepSeekV4PackedRows,
+    ) -> DeepSeekV4PackedRows:
+        return [
+            (list(group_block_ids[0]),)
+            for group_block_ids in packed_group_block_ids
+        ]
+
+    @staticmethod
+    def _timing_enabled() -> bool:
+        return os.getenv("UCM_DEEPSEEK_V4_TIMING", "0") == "1"
+
+    @staticmethod
+    def _debug_enabled() -> bool:
+        return os.getenv("UCM_DEEPSEEK_V4_DEBUG", "0") == "1"
+
+    def _packed_row_bytes(self, rows: DeepSeekV4PackedRows) -> int:
+        total = 0
+        for row in rows:
+            for group_id, group_block_ids in enumerate(row):
+                layout = self.group_layouts.get(group_id)
+                if layout is None:
+                    continue
+                total += len(group_block_ids) * layout.shard_size
+        return total
+
+    def _required_group_block_indices(
+        self,
+        group_id: int,
+        total_hit_tokens: int,
+        min_external_tokens: int = 0,
+    ) -> list[int]:
+        if group_id == 0:
+            start = min_external_tokens // self.HASH_BLOCK_SIZE
+            end = total_hit_tokens // self.HASH_BLOCK_SIZE
+            return list(range(start, end))
+
+        group_block_size = self.GROUP_BLOCK_SIZES[group_id]
+        total_group_blocks = total_hit_tokens // group_block_size
+        tail_blocks = self.GROUP_TAIL_BLOCKS[group_id]
+        assert tail_blocks is not None
+        start = max(0, total_group_blocks - tail_blocks)
+        start = max(start, min_external_tokens // group_block_size)
+        return list(range(start, total_group_blocks))
+
+    def _packed_group_indices(self, canonical_block_idx: int) -> list[list[int]]:
+        end_tokens = (canonical_block_idx + 1) * self.HASH_BLOCK_SIZE
+        return [[canonical_block_idx]] + [
+            self._required_group_block_indices(group_id, end_tokens, 0)
+            for group_id in range(1, len(self.GROUP_BLOCK_SIZES))
+        ]
+
+    def _scratch_block_tensor_views(
+        self,
+        group_id: int,
+        block_pos: int,
+    ) -> list[torch.Tensor]:
+        key = (group_id, block_pos)
+        scratch_views = self._packed_scratch_views.get(key)
+        if scratch_views is None:
+            layout = self.group_layouts[group_id]
+            scratch_views = [
+                torch.empty_like(tensor)
+                for tensor in layout.extract_block_tensor_views([0])
+            ]
+            self._packed_scratch_views[key] = scratch_views
+        return scratch_views
+
+    def _scratch_block_addrs(self, group_id: int, block_pos: int) -> np.ndarray:
+        return np.asarray(
+            [
+                tensor.data_ptr()
+                for tensor in self._scratch_block_tensor_views(group_id, block_pos)
+            ],
+            dtype=np.uint64,
+        )
+
+    def _extract_packed_addrs(
+        self,
+        packed_group_block_ids: DeepSeekV4PackedRows,
+        scratch_for_missing: bool = False,
+    ) -> np.ndarray:
+        rows: list[np.ndarray] = []
+        for group_block_ids in packed_group_block_ids:
+            row_parts: list[np.ndarray] = []
+            for group_id, selected_ids in enumerate(group_block_ids):
+                layout = self.group_layouts.get(group_id)
+                if layout is None:
+                    continue
+                if not selected_ids:
+                    continue
+                for block_pos, block_id in enumerate(selected_ids):
+                    if block_id < 0:
+                        if not scratch_for_missing:
+                            raise ValueError(
+                                f"DeepSeek V4 packed group {group_id} block "
+                                f"position {block_pos} needs a scratch target."
+                            )
+                        row_parts.append(
+                            self._scratch_block_addrs(group_id, block_pos)
+                        )
+                    else:
+                        row_parts.append(
+                            layout.extract_block_addrs([block_id]).reshape(-1)
+                        )
+            if not row_parts:
+                raise ValueError("DeepSeek V4 packed pointer row is empty.")
+            rows.append(np.concatenate(row_parts).astype(np.uint64, copy=False))
+        if not rows:
+            return np.empty((0, 0), dtype=np.uint64)
+        return np.vstack(rows)
+
+    def _extract_packed_tensor_views(
+        self,
+        packed_group_block_ids: DeepSeekV4PackedRows,
+        scratch_for_missing: bool = False,
+    ) -> list[list[torch.Tensor]]:
+        rows: list[list[torch.Tensor]] = []
+        for group_block_ids in packed_group_block_ids:
+            row: list[torch.Tensor] = []
+            for group_id, selected_ids in enumerate(group_block_ids):
+                layout = self.group_layouts.get(group_id)
+                if layout is None or not selected_ids:
+                    continue
+                actual_ids: list[int] = []
+                for block_pos, block_id in enumerate(selected_ids):
+                    if block_id < 0:
+                        if actual_ids:
+                            row.extend(layout.extract_block_tensor_views(actual_ids))
+                            actual_ids = []
+                        if not scratch_for_missing:
+                            raise ValueError(
+                                f"DeepSeek V4 packed group {group_id} block "
+                                f"position {block_pos} needs a scratch target."
+                            )
+                        row.extend(
+                            self._scratch_block_tensor_views(group_id, block_pos)
+                        )
+                    else:
+                        actual_ids.append(block_id)
+                if actual_ids:
+                    row.extend(layout.extract_block_tensor_views(actual_ids))
+            if not row:
+                raise ValueError("DeepSeek V4 packed tensor row is empty.")
+            rows.append(row)
+        return rows
+
+    def _dump_local_stub(
+        self,
+        keys: list[bytes],
+        packed_group_block_ids: DeepSeekV4PackedRows,
+    ) -> None:
+        rows = self._extract_packed_tensor_views(packed_group_block_ids)
+        tensor_size_list = self._packed_tensor_size_list(self.group_layouts)
+        for key, row in zip(keys, rows):
+            if len(row) != len(tensor_size_list):
+                raise ValueError(
+                    f"DeepSeek V4 local stub dump row has {len(row)} tensors, "
+                    f"expected {len(tensor_size_list)}."
+                )
+            payload = {
+                "key_hex": key.hex(),
+                "tensor_size_list": tensor_size_list,
+                "tensors": [tensor.detach().cpu().clone() for tensor in row],
+            }
+            path = self._local_stub_path(key)
+            tmp_path = f"{path}.{os.getpid()}.tmp"
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+
+    def _load_local_stub(
+        self,
+        keys: list[bytes],
+        packed_group_block_ids: DeepSeekV4PackedRows,
+    ) -> None:
+        rows = self._extract_packed_tensor_views(
+            packed_group_block_ids,
+            scratch_for_missing=True,
+        )
+        for key, row in zip(keys, rows):
+            path = self._local_stub_path(key)
+            payload = torch.load(path, map_location="cpu")
+            tensors = payload.get("tensors", [])
+            if len(tensors) != len(row):
+                raise ValueError(
+                    f"DeepSeek V4 local stub load row for {key.hex()} has "
+                    f"{len(tensors)} tensors, expected {len(row)}."
+                )
+            for idx, (dst, src) in enumerate(zip(row, tensors)):
+                if (
+                    dst.numel() * dst.element_size()
+                    != src.numel() * src.element_size()
+                ):
+                    raise ValueError(
+                        f"DeepSeek V4 local stub tensor {idx} size mismatch: "
+                        f"dst={dst.shape}/{dst.dtype}, src={src.shape}/{src.dtype}."
+                    )
+                dst.copy_(src.to(device=dst.device, dtype=dst.dtype).view_as(dst))
+
+    def _capture_enabled(self) -> bool:
+        return os.getenv("UCM_DEEPSEEK_V4_CAPTURE", "0") == "1"
+
+    def _capture_tensor_enabled(self) -> bool:
+        return os.getenv("UCM_DEEPSEEK_V4_CAPTURE_TENSORS", "1") != "0"
+
+    def _capture_dir(self) -> str:
+        capture_dir = os.getenv(
+            "UCM_DEEPSEEK_V4_CAPTURE_DIR",
+            os.path.join(os.getcwd(), "deepseek_v4_ucm_capture"),
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        return capture_dir
+
+    @staticmethod
+    def _safe_capture_name(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+    def _capture_path(self, stage: str, request_id: str) -> str:
+        rank = "scheduler" if self._role == KVConnectorRole.SCHEDULER else self.tp_rank
+        name = (
+            f"{int(time.time() * 1000000)}_"
+            f"{self._safe_capture_name(stage)}_"
+            f"rank{rank}_pid{os.getpid()}_"
+            f"{self._safe_capture_name(request_id)}.pt"
+        )
+        return os.path.join(self._capture_dir(), name)
+
+    def _capture_scheduler_state(
+        self,
+        stage: str,
+        request_id: str,
+        req_meta: DeepSeekV4RequestMeta,
+        extra: Optional[dict] = None,
+    ) -> None:
+        if not self._capture_enabled():
+            return
+        payload = {
+            "stage": stage,
+            "role": "scheduler",
+            "request_id": request_id,
+            "hbm_hit_block_num": req_meta.hbm_hit_block_num,
+            "total_hit_block_num": req_meta.total_hit_block_num,
+            "num_token_ids": req_meta.num_token_ids,
+            "token_processed": req_meta.token_processed,
+            "ucm_block_ids_hex": [key.hex() for key in req_meta.ucm_block_ids],
+            "packed_keys_hex": [
+                self._packed_key(key).hex() for key in req_meta.ucm_block_ids
+            ],
+            "packed_block_ids": {
+                idx: [list(group_ids) for group_ids in group_block_ids]
+                for idx, group_block_ids in req_meta.packed_block_ids.items()
+            },
+            "group_block_sizes": list(self.GROUP_BLOCK_SIZES),
+            "group_tail_blocks": list(self.GROUP_TAIL_BLOCKS),
+            "extra": extra or {},
+        }
+        path = self._capture_path(stage, request_id)
+        torch.save(payload, path)
+        logger.info(f"Captured DeepSeek V4 scheduler metadata to {path}")
+
+    def _capture_worker_payload(
+        self,
+        stage: str,
+        request_id: str,
+        keys: list[bytes],
+        packed_group_block_ids: DeepSeekV4PackedRows,
+        ptrs: Optional[np.ndarray] = None,
+    ) -> None:
+        if not self._capture_enabled():
+            return
+
+        payload: dict[str, object] = {
+            "stage": stage,
+            "role": "worker",
+            "request_id": request_id,
+            "pid": os.getpid(),
+            "tp_rank": self.tp_rank,
+            "tp_size": self.tp_size,
+            "local_rank": self.local_rank,
+            "keys_hex": [key.hex() for key in keys],
+            "packed_group_block_ids": [
+                [list(group_ids) for group_ids in row]
+                for row in packed_group_block_ids
+            ],
+            "group_block_sizes": list(self.GROUP_BLOCK_SIZES),
+            "group_tail_blocks": list(self.GROUP_TAIL_BLOCKS),
+            "tensor_size_list": self._packed_tensor_size_list(self.group_layouts),
+            "shard_size": int(sum(self._packed_tensor_size_list(self.group_layouts))),
+            "ptr_shape": tuple(ptrs.shape) if ptrs is not None else None,
+        }
+
+        if self._capture_tensor_enabled():
+            rows = []
+            for row_idx, group_block_ids in enumerate(packed_group_block_ids):
+                groups = []
+                for group_id, selected_ids in enumerate(group_block_ids):
+                    layout = self.group_layouts.get(group_id)
+                    if layout is None or not selected_ids:
+                        groups.append(
+                            {
+                                "group_id": group_id,
+                                "block_ids": list(selected_ids),
+                                "tensors": [],
+                            }
+                        )
+                        continue
+                    groups.append(
+                        {
+                            "group_id": group_id,
+                            "block_ids": list(selected_ids),
+                            "tensors": []
+                            if any(block_id < 0 for block_id in selected_ids)
+                            else layout.extract_block_tensors(selected_ids),
+                        }
+                    )
+                rows.append({"row_idx": row_idx, "groups": groups})
+            payload["rows"] = rows
+
+        path = self._capture_path(stage, request_id)
+        torch.save(payload, path)
+        logger.info(f"Captured DeepSeek V4 worker payload to {path}")
+
+    def _select_packed_group_block_ids(
+        self,
+        canonical_block_idx: int,
+        blocks: "KVCacheBlocks",
+        allow_null_tail: bool = False,
+        ) -> DeepSeekV4PackedRow:
+        selected: list[list[int]] = []
+        group_indices_by_group = self._packed_group_indices(canonical_block_idx)
+        for group_id, group_indices in enumerate(group_indices_by_group):
+            group_selected: list[int] = []
+            if group_id >= len(blocks.blocks):
+                if group_indices:
+                    raise ValueError(
+                        f"DeepSeek V4 packed group {group_id} is missing from "
+                        f"KVCacheBlocks for canonical block {canonical_block_idx}."
+                    )
+                selected.append(group_selected)
+                continue
+
+            group_blocks = blocks.blocks[group_id]
+            for group_block_idx in group_indices:
+                if group_block_idx >= len(group_blocks):
+                    raise ValueError(
+                        f"DeepSeek V4 packed group {group_id} block index "
+                        f"{group_block_idx} is out of range "
+                        f"(len={len(group_blocks)}) for canonical block "
+                        f"{canonical_block_idx}."
+                    )
+                block = group_blocks[group_block_idx]
+                if block.is_null:
+                    if allow_null_tail and group_id != 0:
+                        group_selected.append(-1)
+                        continue
+                    raise ValueError(
+                        f"DeepSeek V4 packed group {group_id} block index "
+                        f"{group_block_idx} maps to a null HBM block for "
+                        f"canonical block {canonical_block_idx}."
+                    )
+                group_selected.append(block.block_id)
+            selected.append(group_selected)
+        return tuple(selected)
+
+    def _record_packed_block_ids(
+        self,
+        req_meta: DeepSeekV4RequestMeta,
+        blocks: "KVCacheBlocks",
+        end_block: int,
+    ) -> None:
+        for canonical_block_idx in range(end_block):
+            if canonical_block_idx in req_meta.packed_block_ids:
+                continue
+            allow_null_tail = canonical_block_idx < req_meta.total_hit_block_num - 1
+            req_meta.packed_block_ids[canonical_block_idx] = (
+                self._select_packed_group_block_ids(
+                    canonical_block_idx,
+                    blocks,
+                    allow_null_tail=allow_null_tail,
+                )
+            )
+
+    def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
+        if self._local_stub_enabled():
+            return self._local_stub_lookup_on_prefix(external_keys) + 1
+
+        packed_hit_blocks = self.store.lookup_on_prefix(external_keys) + 1
+        if packed_hit_blocks <= 1:
+            return packed_hit_blocks
+
+        if self.group0_store is None:
+            raise RuntimeError("DeepSeek V4 group0 store is not initialized.")
+        group0_hit_blocks = self.group0_store.lookup_on_prefix(external_keys) + 1
+        return min(packed_hit_blocks, group0_hit_blocks + 1)
+
+    def get_num_new_matched_tokens(
+        self,
+        request: "Request",
+        num_computed_tokens: int,
+    ) -> tuple[int, bool]:
+        assert num_computed_tokens % self.HASH_BLOCK_SIZE == 0
+        hbm_hit_block_num = num_computed_tokens // self.HASH_BLOCK_SIZE
+        canonical_hashes = self.generate_hash(
+            self.HASH_BLOCK_SIZE, request.all_token_ids, self._seed
+        )
+
+        if self.persist_token_threshold > request.num_tokens:
+            return 0, False
+
+        external_keys = [
+            self._packed_key(block_hash)
+            for block_hash in canonical_hashes[hbm_hit_block_num:]
+        ]
+        if not external_keys:
+            return 0, False
+
+        try:
+            external_hit_blocks = self._lookup_external_hit_blocks(external_keys)
+        except Exception as e:
+            external_hit_blocks = 0
+            logger.error(
+                f"request {request.request_id} DeepSeek V4 packed lookup error. "
+                f"{type(e).__name__}: {e}"
+            )
+
+        total_hit_block_num = hbm_hit_block_num + external_hit_blocks
+        external_hit_tokens = external_hit_blocks * self.HASH_BLOCK_SIZE
+        num_total_hit_tokens = total_hit_block_num * self.HASH_BLOCK_SIZE
+        if num_total_hit_tokens == request.num_tokens:
+            external_hit_tokens -= 1
+
+        self.requests_meta[request.request_id] = DeepSeekV4RequestMeta(
+            ucm_block_ids=canonical_hashes,
+            hbm_hit_block_num=hbm_hit_block_num,
+            total_hit_block_num=total_hit_block_num,
+            num_token_ids=len(request.all_token_ids),
+            token_processed=num_total_hit_tokens,
+        )
+        self._capture_scheduler_state(
+            "lookup",
+            request.request_id,
+            self.requests_meta[request.request_id],
+            {
+                "num_computed_tokens": num_computed_tokens,
+                "external_hit_blocks": external_hit_blocks,
+                "external_hit_tokens": external_hit_tokens,
+                "request_num_tokens": request.num_tokens,
+                "all_token_ids": list(request.all_token_ids),
+            },
+        )
+
+        logger.info_once(
+            f"DeepSeek V4 request_id: {request.request_id}, "
+            f"total_blocks_num: {len(canonical_hashes)}, "
+            f"hit hbm: {hbm_hit_block_num}, "
+            f"hit external: {external_hit_blocks}"
+        )
+        return external_hit_tokens, False
+
+    def update_state_after_alloc(
+        self,
+        request: "Request",
+        blocks: "KVCacheBlocks",
+        num_external_tokens: int,
+    ) -> None:
+        req_meta = self.requests_meta.get(request.request_id)
+        if req_meta is None:
+            return
+
+        max_full_blocks = req_meta.num_token_ids // self.HASH_BLOCK_SIZE
+        group0_blocks = len(blocks.blocks[0]) if blocks.blocks else 0
+        end_block = min(max_full_blocks, group0_blocks)
+        if end_block == 0:
+            return
+
+        try:
+            self._record_packed_block_ids(req_meta, blocks, end_block)
+        except Exception as e:
+            logger.error(
+                f"request {request.request_id} record DeepSeek V4 HBM-aligned "
+                f"block ids failed. {type(e).__name__}: {e}"
+            )
+            raise
+
+        if self._debug_enabled():
+            block_lens = [len(group) for group in blocks.blocks]
+            null_counts = [
+                sum(1 for block in group if block.is_null)
+                for group in blocks.blocks
+            ]
+            selected_lens = {
+                idx: [len(group) for group in group_ids]
+                for idx, group_ids in sorted(req_meta.packed_block_ids.items())
+            }
+            logger.info(
+                f"DeepSeek V4 HBM block map request_id={request.request_id}, "
+                f"num_external_tokens={num_external_tokens}, "
+                f"block_lens={block_lens}, null_counts={null_counts}, "
+                f"selected_lens={selected_lens}"
+            )
+        self._capture_scheduler_state(
+            "after_alloc",
+            request.request_id,
+            req_meta,
+            {
+                "num_external_tokens": num_external_tokens,
+                "block_lens": [len(group) for group in blocks.blocks],
+                "null_counts": [
+                    sum(1 for block in group if block.is_null)
+                    for group in blocks.blocks
+                ],
+                "block_ids": [
+                    [block.block_id for block in group]
+                    for group in blocks.blocks
+                ],
+                "is_null": [
+                    [block.is_null for block in group]
+                    for group in blocks.blocks
+                ],
+            },
+        )
+
+    def _make_dispatch_meta(
+        self,
+        request_id: str,
+        req_meta: DeepSeekV4RequestMeta,
+        new_tokens: int,
+        need_load: bool,
+    ) -> DeepSeekV4RequestDispatchMeta:
+        load_keys: list[bytes] = []
+        load_group_block_ids: DeepSeekV4PackedRows = []
+        if need_load and req_meta.total_hit_block_num > req_meta.hbm_hit_block_num:
+            load_indices = list(
+                range(req_meta.hbm_hit_block_num, req_meta.total_hit_block_num)
+            )
+            load_keys = [
+                self._packed_key(req_meta.ucm_block_ids[idx])
+                for idx in load_indices
+            ]
+            load_group_block_ids = [
+                req_meta.packed_block_ids[idx]
+                for idx in load_indices
+            ]
+            self._capture_scheduler_state(
+                "dispatch_load",
+                request_id,
+                req_meta,
+                {"load_indices": load_indices},
+            )
+
+        dump_keys: list[bytes] = []
+        dump_group_block_ids: DeepSeekV4PackedRows = []
+        if req_meta.token_processed < req_meta.num_token_ids:
+            start_block = req_meta.token_processed // self.HASH_BLOCK_SIZE
+            end_block = (req_meta.token_processed + new_tokens) // self.HASH_BLOCK_SIZE
+            if end_block > start_block:
+                dump_indices = list(range(start_block, end_block))
+                dump_keys = [
+                    self._packed_key(req_meta.ucm_block_ids[idx])
+                    for idx in dump_indices
+                ]
+                dump_group_block_ids = [
+                    req_meta.packed_block_ids[idx]
+                    for idx in dump_indices
+                ]
+                self._capture_scheduler_state(
+                    "dispatch_dump",
+                    request_id,
+                    req_meta,
+                    {"dump_indices": dump_indices},
+                )
+            req_meta.token_processed += new_tokens
+
+        return DeepSeekV4RequestDispatchMeta(
+            (load_keys, load_group_block_ids),
+            (dump_keys, dump_group_block_ids),
+        )
+
+    def build_connector_meta(
+        self, scheduler_output: SchedulerOutput
+    ) -> KVConnectorMetadata:
+        requests_dispatch_meta: dict[str, DeepSeekV4RequestDispatchMeta] = {}
+
+        for request in scheduler_output.scheduled_new_reqs:
+            req_meta = self.requests_meta.get(request.req_id)
+            if req_meta:
+                requests_dispatch_meta[request.req_id] = self._make_dispatch_meta(
+                    request.req_id,
+                    req_meta,
+                    scheduler_output.num_scheduled_tokens[request.req_id],
+                    True,
+        )
+
+        cached = scheduler_output.scheduled_cached_reqs
+        for request_id in cached.req_ids:
+            req_meta = self.requests_meta.get(request_id)
+            if not req_meta:
+                continue
+            resumed = request_id in cached.resumed_req_ids
+            requests_dispatch_meta[request_id] = self._make_dispatch_meta(
+                request_id,
+                req_meta,
+                scheduler_output.num_scheduled_tokens[request_id],
+                resumed,
+            )
+
+        for request_id in scheduler_output.finished_req_ids:
+            self.requests_meta.pop(request_id, None)
+
+        return UCMDeepSeekV4ConnectorMetadata(requests_dispatch_meta)
+
+    def _submit_load_task(
+        self,
+        request_id: str,
+        label: str,
+        store: UcmKVStoreBaseV1,
+        keys: list[bytes],
+        packed_group_block_ids: DeepSeekV4PackedRows,
+        ptrs: np.ndarray,
+        capture_payload: bool,
+        timing: bool,
+    ) -> DeepSeekV4LoadTask:
+        shard_indexs = [0] * len(keys)
+        submit_start = time.perf_counter()
+        task = store.load_data(keys, shard_indexs, ptrs)
+        byte_count = self._packed_row_bytes(packed_group_block_ids)
+        if timing:
+            logger.info(
+                f"DeepSeek V4 {label} load submit request_id={request_id} "
+                f"keys={len(keys)} bytes={byte_count} "
+                f"elapsed_s={time.perf_counter() - submit_start:.6f}"
+            )
+        return DeepSeekV4LoadTask(
+            request_id=request_id,
+            label=label,
+            store=store,
+            task=task,
+            keys=keys,
+            packed_group_block_ids=packed_group_block_ids,
+            ptrs=ptrs,
+            capture_payload=capture_payload,
+            byte_count=byte_count,
+        )
+
+    def _wait_load_task(
+        self,
+        load_task: DeepSeekV4LoadTask,
+        timing: bool,
+    ) -> None:
+        wait_start = time.perf_counter()
+        try:
+            load_task.store.wait(load_task.task)
+            if timing:
+                logger.info(
+                    f"DeepSeek V4 {load_task.label} load wait "
+                    f"request_id={load_task.request_id} "
+                    f"keys={len(load_task.keys)} bytes={load_task.byte_count} "
+                    f"elapsed_s={time.perf_counter() - wait_start:.6f}"
+                )
+            if load_task.capture_payload:
+                self._capture_worker_payload(
+                    "load_after",
+                    load_task.request_id,
+                    load_task.keys,
+                    load_task.packed_group_block_ids,
+                    load_task.ptrs,
+                )
+        except Exception as e:
+            logger.error(
+                f"request {load_task.request_id} wait DeepSeek V4 packed load "
+                f"task label={load_task.label} "
+                f"elapsed_s={time.perf_counter() - wait_start:.6f} "
+                f"error. {type(e).__name__}: {e}"
+            )
+
+    def _submit_dump_task(
+        self,
+        label: str,
+        store: UcmKVStoreBaseV1,
+        keys: list[bytes],
+        ptrs: np.ndarray,
+        packed_group_block_ids: DeepSeekV4PackedRows,
+        event_handle,
+        timing: bool,
+    ) -> DeepSeekV4DumpTask:
+        shard_indexs = [0] * len(keys)
+        submit_start = time.perf_counter()
+        task = store.dump_data(keys, shard_indexs, ptrs, event_handle)
+        byte_count = self._packed_row_bytes(packed_group_block_ids)
+        if timing:
+            logger.info(
+                f"DeepSeek V4 {label} dump submit keys={len(keys)} "
+                f"bytes={byte_count} "
+                f"elapsed_s={time.perf_counter() - submit_start:.6f}"
+            )
+        return DeepSeekV4DumpTask(
+            label=label,
+            store=store,
+            task=task,
+            key_count=len(keys),
+            byte_count=byte_count,
+        )
+
+    def _wait_dump_task(self, dump_task: DeepSeekV4DumpTask, timing: bool) -> None:
+        wait_start = time.perf_counter()
+        dump_task.store.wait(dump_task.task)
+        if timing:
+            logger.info(
+                f"DeepSeek V4 {dump_task.label} dump wait "
+                f"keys={dump_task.key_count} bytes={dump_task.byte_count} "
+                f"elapsed_s={time.perf_counter() - wait_start:.6f}"
+            )
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMDeepSeekV4ConnectorMetadata)
+
+        tasks: list[DeepSeekV4LoadTask] = []
+        timing = self._timing_enabled()
+        for request_id, request in metadata.request_meta.items():
+            keys, packed_group_block_ids = request.load_block_ids
+            if not keys:
+                continue
+            try:
+                if self._local_stub_enabled():
+                    ptrs = self._extract_packed_addrs(
+                        packed_group_block_ids,
+                        scratch_for_missing=True,
+                    )
+                    self._capture_worker_payload(
+                        "load_before",
+                        request_id,
+                        keys,
+                        packed_group_block_ids,
+                        ptrs,
+                    )
+                    self._load_local_stub(keys, packed_group_block_ids)
+                    self._capture_worker_payload(
+                        "load_after",
+                        request_id,
+                        keys,
+                        packed_group_block_ids,
+                        ptrs,
+                    )
+                    continue
+
+                if len(keys) > 1:
+                    if self.group0_store is None:
+                        raise RuntimeError(
+                            "DeepSeek V4 group0 store is not initialized."
+                        )
+                    group0_keys = keys[:-1]
+                    group0_block_ids = self._group0_only_rows(
+                        packed_group_block_ids[:-1]
+                    )
+                    group0_ptrs = self._extract_packed_addrs(group0_block_ids)
+                    tasks.append(
+                        self._submit_load_task(
+                            request_id,
+                            "group0",
+                            self.group0_store,
+                            group0_keys,
+                            group0_block_ids,
+                            group0_ptrs,
+                            False,
+                            timing,
+                        )
+                    )
+
+                full_keys = keys[-1:]
+                full_group_block_ids = packed_group_block_ids[-1:]
+                full_ptrs = self._extract_packed_addrs(
+                    full_group_block_ids,
+                    scratch_for_missing=True,
+                )
+                self._capture_worker_payload(
+                    "load_before",
+                    request_id,
+                    full_keys,
+                    full_group_block_ids,
+                    full_ptrs,
+                )
+                tasks.append(
+                    self._submit_load_task(
+                        request_id,
+                        "packed",
+                        self.store,
+                        full_keys,
+                        full_group_block_ids,
+                        full_ptrs,
+                        True,
+                        timing,
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit DeepSeek V4 packed load task "
+                    f"error. {type(e).__name__}: {e}"
+                )
+
+        for load_task in tasks:
+            self._wait_load_task(load_task, timing)
+
+    def wait_for_save(self) -> None:
+        metadata = self._get_connector_metadata()
+        assert isinstance(metadata, UCMDeepSeekV4ConnectorMetadata)
+
+        keys: list[bytes] = []
+        packed_group_block_rows: DeepSeekV4PackedRows = []
+        packed_rows: list[np.ndarray] = []
+        for request_id, request in metadata.request_meta.items():
+            req_keys, packed_group_block_ids = request.dump_block_ids
+            if not req_keys:
+                continue
+            try:
+                rows = self._extract_packed_addrs(packed_group_block_ids)
+                self._capture_worker_payload(
+                    "dump_before",
+                    request_id,
+                    req_keys,
+                    packed_group_block_ids,
+                    rows,
+                )
+            except Exception as e:
+                logger.error(
+                    f"prepare DeepSeek V4 packed dump rows failed. "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            keys.extend(req_keys)
+            packed_group_block_rows.extend(packed_group_block_ids)
+            packed_rows.append(rows)
+
+        if not keys:
+            return
+
+        if self._local_stub_enabled():
+            if self.tp_rank == 0:
+                try:
+                    self._dump_local_stub(keys, packed_group_block_rows)
+                except Exception as e:
+                    logger.error(
+                        f"dump DeepSeek V4 local stub failed. {type(e).__name__}: {e}"
+                    )
+            return
+
+        if self.tp_rank != 0:
+            return
+
+        try:
+            ptrs = np.vstack(packed_rows)
+            event_handle = self._get_dump_event_handle()
+            tasks: list[DeepSeekV4DumpTask] = []
+            timing = self._timing_enabled()
+            if self.group0_store is None:
+                raise RuntimeError("DeepSeek V4 group0 store is not initialized.")
+            group0_rows = self._group0_only_rows(packed_group_block_rows)
+            group0_ptrs = self._extract_packed_addrs(group0_rows)
+            tasks.append(
+                self._submit_dump_task(
+                    "group0",
+                    self.group0_store,
+                    keys,
+                    group0_ptrs,
+                    group0_rows,
+                    event_handle,
+                    timing,
+                )
+            )
+            tasks.append(
+                self._submit_dump_task(
+                    "packed",
+                    self.store,
+                    keys,
+                    ptrs,
+                    packed_group_block_rows,
+                    event_handle,
+                    timing,
+                )
+            )
+            for dump_task in tasks:
+                self._wait_dump_task(dump_task, timing)
+        except Exception as e:
+            logger.error(
+                f"dump DeepSeek V4 packed kv cache failed. {type(e).__name__}: {e}"
+            )
+
+
+class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def __init__(self, vllm_config: "VllmConfig", role: KVConnectorRole):
         super().__init__(vllm_config=vllm_config, role=role)
         self.connector: KVConnectorBase_V1
@@ -1179,7 +2534,16 @@ class UCMConnector(KVConnectorBase_V1):
             > 1
         )
 
-        if use_lite:
+        model_type = getattr(
+            self._vllm_config.model_config.hf_text_config, "model_type", ""
+        )
+        use_deepseek_v4 = self.launch_config.get(
+            "deepseek_v4", model_type == "deepseek_v4"
+        )
+
+        if use_deepseek_v4:
+            self.connector = UCMDeepSeekV4Connector(vllm_config, role)
+        elif use_lite:
             self.connector = UCMLiteConnector(vllm_config, role)
         elif use_ratio_rate:
             self.connector = UCMMockConnector(vllm_config, role)
@@ -1322,6 +2686,13 @@ class UCMConnector(KVConnectorBase_V1):
         This prevents overwrites of paged KV buffer before saving done.
         """
         self.connector.wait_for_save()
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, object] | None]:
+        return False, None
 
     def clear_connector_metadata(self) -> None:
         """Clear the connector metadata.
