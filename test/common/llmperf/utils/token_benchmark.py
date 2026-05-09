@@ -22,6 +22,7 @@ from common.llmperf.utils.utils import (
     sample_random_positive_int,
 )
 from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizerFast
 
 
 def generate_fixed_token_prompt(
@@ -82,7 +83,11 @@ def get_token_throughput_latencies(
     random.seed(random_seed)
 
     print(f"Using tokenizer:{tokenizer_path}")
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer_json = Path(tokenizer_path) / "tokenizer.json"
+    if tokenizer_json.exists():
+        tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer_json))
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
     tok_tool = HuggingFaceTokenizer(tokenizer_path)
     get_token_length = lambda text: len(tokenizer.encode(text))
 
@@ -155,8 +160,7 @@ def get_token_throughput_latencies(
                     else:
                         metrics[common_metrics.TPOT] = 0.0
 
-                    completed_requests.append(metrics)
-
+                metrics.setdefault(common_metrics.TPOT, 0.0)
                 completed_requests.append(metrics)
 
                 incremental_time_delay += metrics.get(
