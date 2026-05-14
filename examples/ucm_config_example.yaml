@@ -15,8 +15,8 @@ ucm_connectors:
     ucm_connector_config:
       store_pipeline: "Cache|Posix"
       storage_backends: "/mnt/test"
-      io_direct: false
-      # cache_buffer_capacity_gb: 256
+      share_buffer_enable: true
+      cache_buffer_capacity_gb: 32
       # posix_capacity_gb: 1024
 
 # When you use UcmNfsStore, you should set enable_event_sync to false.
@@ -30,7 +30,7 @@ enable_event_sync: true
 
 
 # Whether to use layerwise loading/saving (optional, default: True for UCMConnector)
-use_layerwise: true
+use_layerwise: false
 # hit_ratio: 0.9
 
 # Whether to record requests' traces (optional, default: False)
