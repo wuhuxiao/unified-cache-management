@@ -818,7 +818,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
         self.group_tail_blocks = self._get_group_tail_blocks()
         self.group_window_spans = self._get_group_window_spans()
-        self.group_metas: dict[int, KVCacheGroupMeta] = {}
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
