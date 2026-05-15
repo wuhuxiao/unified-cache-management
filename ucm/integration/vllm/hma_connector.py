@@ -238,13 +238,20 @@ class KVCacheGroupLayout:
         logical_offsets: np.ndarray,
         group_tensor_block_size: int,
     ) -> np.ndarray:
-        logical_offsets = np.asarray(logical_offsets, dtype=np.uint64)
-        scaled = logical_offsets[:, None] * self.view_tensor_block_sizes[None, :]
+        signed_offsets = np.asarray(logical_offsets, dtype=np.int64)
+        if signed_offsets.ndim != 1:
+            raise ValueError(
+                "KV cache logical offsets for batch address extraction must be 1-D."
+            )
+        if np.any(signed_offsets < 0):
+            raise ValueError("Negative KV cache logical offset is invalid.")
+        offsets_np = signed_offsets.astype(np.uint64, copy=False)
+        scaled = offsets_np[:, None] * self.view_tensor_block_sizes[None, :]
         group_size = np.uint64(group_tensor_block_size)
         misaligned = scaled % group_size
         if np.any(misaligned):
             raise ValueError(
-                f"Logical offsets {logical_offsets.tolist()} do not align with "
+                f"Logical offsets {offsets_np.tolist()} do not align with "
                 f"view tensor block sizes={self.view_tensor_block_sizes.tolist()} "
                 f"and group tensor block size={group_tensor_block_size}."
             )
@@ -308,16 +315,16 @@ class KVCacheGroupLayout:
         group_tensor_block_size: int,
     ) -> np.ndarray:
         signed_block_ids = np.asarray(block_ids, dtype=np.int64)
-        offsets_np = np.asarray(offsets, dtype=np.uint64)
+        signed_offsets = np.asarray(offsets, dtype=np.int64)
         if signed_block_ids.ndim != 1:
             raise ValueError(
                 "KV cache block ids for batch address extraction must be 1-D."
             )
-        if offsets_np.ndim != 1:
+        if signed_offsets.ndim != 1:
             raise ValueError(
                 "KV cache logical offsets for batch address extraction must be 1-D."
             )
-        if len(signed_block_ids) != len(offsets_np):
+        if len(signed_block_ids) != len(signed_offsets):
             raise ValueError(
                 "KV cache block ids and logical offsets must have the same length."
             )
@@ -325,9 +332,11 @@ class KVCacheGroupLayout:
             return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
         if np.any(signed_block_ids < 0):
             raise ValueError("Negative KV cache block id needs a scratch target.")
+        if np.any(signed_offsets < 0):
+            raise ValueError("Negative KV cache logical offset is invalid.")
         block_ids_np = signed_block_ids.astype(np.uint64, copy=False)
         tensor_offsets = self._tensor_tokens_for_logical_batch(
-            offsets_np,
+            signed_offsets,
             group_tensor_block_size,
         )
         return (

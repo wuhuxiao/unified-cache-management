@@ -869,6 +869,49 @@ def test_layout_rejects_batch_address_mismatched_lengths():
         )
 
 
+def test_layout_rejects_batch_address_negative_offsets():
+    tensor = torch.empty((4, 128, 3), dtype=torch.float32)
+    layout = KVCacheGroupLayout({"layer.0": tensor})
+
+    with pytest.raises(ValueError, match="Negative KV cache logical offset"):
+        layout.extract_segment_addrs_batch(
+            np.asarray([1], dtype=np.int64),
+            np.asarray([-1], dtype=np.int64),
+            group_tensor_block_size=16384,
+        )
+
+
+def test_layout_rejects_batch_address_negative_block_ids():
+    tensor = torch.empty((4, 128, 3), dtype=torch.float32)
+    layout = KVCacheGroupLayout({"layer.0": tensor})
+
+    with pytest.raises(ValueError, match="Negative KV cache block id"):
+        layout.extract_segment_addrs_batch(
+            np.asarray([-1], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            group_tensor_block_size=16384,
+        )
+
+
+def test_layout_rejects_batch_address_non_1d_inputs():
+    tensor = torch.empty((4, 128, 3), dtype=torch.float32)
+    layout = KVCacheGroupLayout({"layer.0": tensor})
+
+    with pytest.raises(ValueError, match="block ids.*1-D"):
+        layout.extract_segment_addrs_batch(
+            np.asarray([[1]], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            group_tensor_block_size=16384,
+        )
+
+    with pytest.raises(ValueError, match="logical offsets.*1-D"):
+        layout.extract_segment_addrs_batch(
+            np.asarray([1], dtype=np.int64),
+            np.asarray([[0]], dtype=np.int64),
+            group_tensor_block_size=16384,
+        )
+
+
 def test_layout_handles_single_4d_ascend_tensor_shape():
     tensor = torch.empty((2, 128, 1, 512), dtype=torch.bfloat16)
     layout = KVCacheGroupLayout({"layer.0": tensor})
