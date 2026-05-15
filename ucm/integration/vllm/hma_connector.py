@@ -1438,6 +1438,11 @@ class UCMFAWAConnector(UCMDirectConnector):
         if hash_end <= hash_start:
             return []
         meta = self.group_metas[group_id]
+        token_blocks_per_tensor_block = (
+            self.group_tensor_block_ratios[group_id]
+            if hasattr(self, "group_tensor_block_ratios")
+            else meta.tensor_block_size // meta.token_block_size
+        )
         if window_tail_only:
             if not meta.tail_blocks:
                 return []
@@ -1448,18 +1453,16 @@ class UCMFAWAConnector(UCMDirectConnector):
                     hash_idx * meta.logical_blocks_per_hash_block,
                     logical_end - meta.tail_blocks,
                 )
-                alloc_start = logical_start // meta.hash_blocks_per_tensor_block
-                alloc_end = (
-                    (logical_end - 1) // meta.hash_blocks_per_tensor_block
-                ) + 1
+                alloc_start = logical_start // token_blocks_per_tensor_block
+                alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
                 selected.extend(group_block_ids[alloc_start:alloc_end])
             return selected
 
         alloc_start = (
             hash_start * meta.logical_blocks_per_hash_block
-        ) // meta.hash_blocks_per_tensor_block
+        ) // token_blocks_per_tensor_block
         logical_end = hash_end * meta.logical_blocks_per_hash_block
-        alloc_end = ((logical_end - 1) // meta.hash_blocks_per_tensor_block) + 1
+        alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
         return group_block_ids[alloc_start:alloc_end]
 
     def _generate_dispatch_meta(
@@ -1569,10 +1572,14 @@ class UCMFAWAConnector(UCMDirectConnector):
                     new_block_ids = tuple([] for _ in self.group_metas)
                 else:
                     new_block_ids = tuple(new_block_ids)
-                resumed_from_preemption = (
-                    getattr(scheduled_cached_reqs, "resumed_from_preemption", False)
-                    or request_id in scheduled_cached_reqs.resumed_req_ids
-                )
+                if hasattr(scheduled_cached_reqs, "resumed_from_preemption"):
+                    resumed_from_preemption = (
+                        scheduled_cached_reqs.resumed_from_preemption[i]
+                    )
+                else:
+                    resumed_from_preemption = (
+                        request_id in scheduled_cached_reqs.resumed_req_ids
+                    )
                 if resumed_from_preemption:
                     req_meta.vllm_block_ids = tuple([] for _ in self.group_metas)
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(

@@ -214,6 +214,96 @@ def test_zero_tail_window_group_uses_empty_candidate_list():
     assert dispatch.dump_vllm_block_ids == ([10], [103], [])
 
 
+def test_cached_resumed_from_preemption_list_resets_only_matching_request():
+    connector = make_connector()
+    first_meta = FAWARequestMeta(
+        ucm_block_ids=[b"a", b"b"],
+        num_token_ids=512,
+        vllm_block_ids=([10], [100, 101, 102, 103]),
+        token_processed=256,
+    )
+    second_meta = FAWARequestMeta(
+        ucm_block_ids=[b"c", b"d"],
+        num_token_ids=512,
+        vllm_block_ids=([20], [200, 201, 202, 203]),
+        token_processed=0,
+    )
+    connector.requests_meta["req-append"] = first_meta
+    connector.requests_meta["req-reset"] = second_meta
+
+    cached_reqs = type(
+        "CachedReqs",
+        (),
+        {
+            "req_ids": ["req-append", "req-reset"],
+            "resumed_req_ids": set(),
+            "resumed_from_preemption": [False, True],
+            "new_block_ids": [
+                ([11], [104, 105, 106, 107]),
+                ([21], [204, 205, 206, 207]),
+            ],
+        },
+    )()
+    metadata = connector.build_connector_meta(
+        FakeSchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=cached_reqs,
+            num_scheduled_tokens={"req-append": 256, "req-reset": 256},
+            finished_req_ids=set(),
+        )
+    )
+
+    assert metadata.request_meta["req-append"].dump_vllm_block_ids == ([11], [107])
+    assert first_meta.vllm_block_ids == (
+        [10, 11],
+        [100, 101, 102, 103, 104, 105, 106, 107],
+    )
+    assert metadata.request_meta["req-reset"].dump_vllm_block_ids == ([21], [207])
+    assert second_meta.vllm_block_ids == ([21], [204, 205, 206, 207])
+
+
+def test_slice_group_block_ids_uses_tensor_block_ratio_for_large_blocks():
+    connector = make_connector()
+    connector.hash_block_size = 256
+    connector.group_token_block_sizes = (64, 64)
+    connector.group_tensor_block_sizes = (512, 512)
+    connector.group_tensor_block_ratios = (8, 8)
+    connector.fa_group_ids = (0,)
+    connector.window_group_ids = (1,)
+    connector.group_tail_blocks = (None, 1)
+    connector.group_window_spans = ((256,), (64,))
+    connector._init_group_metas()
+
+    assert connector._slice_group_block_ids(
+        0,
+        [100, 101],
+        0,
+        1,
+        window_tail_only=False,
+    ) == [100]
+    assert connector._slice_group_block_ids(
+        0,
+        [100, 101],
+        0,
+        3,
+        window_tail_only=False,
+    ) == [100, 101]
+    assert connector._slice_group_block_ids(
+        1,
+        [100, 101],
+        0,
+        1,
+        window_tail_only=True,
+    ) == [100]
+    assert connector._slice_group_block_ids(
+        1,
+        [100, 101],
+        2,
+        3,
+        window_tail_only=True,
+    ) == [101]
+
+
 class FakeStore:
     def __init__(self, hit_index: int, lookup_hits: list[bool] | None = None):
         self.hit_index = hit_index
