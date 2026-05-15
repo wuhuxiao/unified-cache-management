@@ -26,6 +26,7 @@ Use this skill when working on `ucm/integration/vllm/hma_connector.py` or the `U
 
 ## Invariants
 
+- Keep `hma_connector.py` minimal and production-first. Do not retain helpers, compatibility properties, debug utilities, or test-only accessors unless the current connector runtime calls them directly.
 - Keep the implementation general. Do not add DeepSeek-specific class or variable names to FAWA logic.
 - Keep block-size naming scoped to three concepts:
   - `hash_block_size`: connector hash/store-key block size.
@@ -37,15 +38,17 @@ Use this skill when working on `ucm/integration/vllm/hma_connector.py` or the `U
 - `hash_block_size` comes from the FA kv-cache group block size. For current DeepSeek V4-style layouts this is usually `256`.
 - Assume `hash_block_size >= window_tail_tokens` for supported FAWA layouts. Do not add early-window padding rows for cases where a canonical hash-block boundary cannot cover the configured WA tail; treat that as an invalid layout/configuration and fail explicitly.
 - Supported HMA allocation rows must not contain negative HBM block ids. Do not add `block_id < 0` guards, null-block slow paths, or `is_null -> -1` conversions to FAWA runtime logic.
-- Remote keys currently use `generate_hash(self.hash_block_size, request.all_token_ids, self._seed)` plus `_block_key()`. Do not switch to `request.block_hashes` unless explicitly requested.
+- Remote keys use the raw canonical hashes from `generate_hash(self.hash_block_size, request.all_token_ids, self._seed)`. Do not namespace/hash-wrap them in `hma_connector.py`; FA and WA isolation is provided by separate store directories.
 - Keep the full-hit `external_hit_tokens -= 1` behavior unless the user explicitly asks to change it.
 - `group_tail_blocks` for compressor state groups depends on model ratio:
   - if `window_tokens <= compress_ratio`, tail blocks are `0`.
   - otherwise `ceil((window_tokens - compress_ratio) / group_block_size)`.
   - non-compressor window groups use `max(1, ceil(window_tokens / group_block_size))`.
+- WA groups whose `group_tail_blocks[group_id] == 0` must be excluded from runtime store metadata: do not include them in WA store tensor sizing, WA load pointer rows, or WA dump pointer rows.
 - `update_state_after_alloc()` must record allocated group block ids for all groups and immediately derive any contiguous `group_block_ids` that are now recoverable.
 - Chunk prefill may provide partial `new_block_ids`; only create dump rows for contiguous fully recorded canonical blocks.
 - Chunk prefill dump progress is governed by `store_block_cursor`, not only `token_processed`. A partial allocation can advance `token_processed` to request length before all group rows are recorded; later allocation completion must still be able to dump remaining contiguous rows.
+- Runtime perf should measure prefix-hit load over the full configured input, for example a 1M-token full hit, but chunk-prefill dump as a single scheduler chunk. For a 1M-token request with 4K-token chunks, one chunk dump covers only that chunk's canonical rows; do not report 256 chunks of dump work as one runtime interface call.
 - For external hits, `build_connector_meta()` must only build a load plan after `group_block_ids` exist for the full external-hit prefix. Missing rows usually means `update_state_after_alloc()` failed to record allocated groups.
 - Load failures reported through `get_block_ids_with_load_errors()` must use vLLM/HMA block ids from the first KV-cache group anchor row. vLLM's scheduler currently matches invalid ids against the first block-id list from `kv_cache_manager.get_block_ids(req_id)`, so FAWA must not report WA/state group block ids, hash block indices, or canonical row indices.
 - FAWA dump completion is synchronous inside `wait_for_save()`: rank-0 submits FA/WA dump tasks and waits them before returning. Keep `request_finished_all_groups()` and `get_finished()` free of dump-task ownership unless the implementation is deliberately changed to async block release.

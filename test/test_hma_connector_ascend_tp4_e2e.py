@@ -11,6 +11,9 @@ from test_hma_connector_chunk_prefill import (
     FakeKVCacheBlocks,
     FakeRequest,
     FakeSchedulerOutput,
+    dump_block_ids,
+    load_block_ids,
+    materialize_rows,
     make_ascend_connector,
 )
 
@@ -110,7 +113,7 @@ def make_token_ids(block_size: int, block_values: list[int]) -> list[int]:
 
 def generated_hashes(block_size: int, token_ids: list[int], seed) -> list[bytes]:
     return [
-        f"h{token_ids[start]}".encode()
+        f"h{token_ids[start]}".encode().ljust(16, b"\0")
         for start in range(0, len(token_ids), block_size)
         if len(token_ids[start : start + block_size]) == block_size
     ]
@@ -159,14 +162,28 @@ def group_addrs(
             layout = worker.group_layouts.get(group_id)
             if layout is None or not selected_group:
                 continue
-            for segment in selected_group:
+            block_ids = np.asarray(
+                [segment.block_id for segment in selected_group],
+                dtype=np.int64,
+            )
+            offsets = np.asarray(
+                [segment.offset for segment in selected_group],
+                dtype=np.int64,
+            )
+            if len(block_ids):
                 row_parts.append(
-                    layout.extract_segment_addrs_flat(
-                        segment,
+                    layout.extract_segment_addrs_flat_batch(
+                        block_ids,
+                        offsets,
                         worker.group_tensor_block_sizes[group_id],
                     )
                 )
-        rows.append(np.concatenate(row_parts).astype(np.uint64, copy=False))
+        rows.append(
+            np.concatenate(row_parts, axis=1).reshape(-1).astype(
+                np.uint64,
+                copy=False,
+            )
+        )
     return np.vstack(rows)
 
 
@@ -177,15 +194,10 @@ def build_allocation(
 ) -> tuple[list[int], ...]:
     allocation: list[list[int]] = []
     for group_id in range(len(connector.group_token_block_sizes)):
-        max_tensor_idx = -1
-        for canonical_idx in range(canonical_blocks):
-            computed_end = (canonical_idx + 1) * connector.hash_block_size
-            for group_block_idx in connector._group_block_range(group_id, computed_end):
-                tensor_idx = connector.block_span_layout.allocation_index(
-                    group_id,
-                    group_block_idx,
-                )
-                max_tensor_idx = max(max_tensor_idx, tensor_idx)
+        row_indices = np.arange(canonical_blocks, dtype=np.int64)
+        group_indices = connector._group_block_index_matrix(group_id, row_indices)
+        allocation_indices = connector._allocation_index_matrix(group_id, group_indices)
+        max_tensor_idx = int(allocation_indices.max()) if allocation_indices.size else -1
         allocation.append([base_block_id + idx for idx in range(max_tensor_idx + 1)])
     return tuple(allocation)
 
@@ -252,8 +264,10 @@ def make_worker(
     worker.group_tensor_block_sizes = scheduler.group_tensor_block_sizes
     worker.group_tail_blocks = scheduler.group_tail_blocks
     worker.group_window_spans = scheduler.group_window_spans
+    worker.store_window_group_ids = scheduler._active_store_window_group_ids()
     worker.block_span_layout = scheduler.block_span_layout
     worker._ascend_layout = scheduler._ascend_layout
+    worker._kv_cache_config = scheduler._kv_cache_config
     worker.group_layouts = group_layouts
     worker.fa_store = fa_store
     worker.wa_store = wa_store
@@ -317,16 +331,24 @@ def bind_and_register(
 ) -> None:
     worker.bind_connector_metadata(metadata)
     for request_meta in metadata.request_meta.values():
-        load_keys, load_rows = request_meta.load_block_ids
+        load_keys, load_rows = load_block_ids(worker, request_meta)
         if load_keys:
             register_rows(worker, worker.fa_store, load_rows, worker.fa_group_ids)
             register_rows(
-                worker, worker.wa_store, load_rows[-1:], worker.window_group_ids
+                worker,
+                worker.wa_store,
+                load_rows[-1:],
+                worker._active_store_window_group_ids(),
             )
-        dump_keys, dump_rows = request_meta.dump_block_ids
+        dump_keys, dump_rows = dump_block_ids(worker, request_meta)
         if dump_keys:
             register_rows(worker, worker.fa_store, dump_rows, worker.fa_group_ids)
-            register_rows(worker, worker.wa_store, dump_rows, worker.window_group_ids)
+            register_rows(
+                worker,
+                worker.wa_store,
+                dump_rows,
+                worker._active_store_window_group_ids(),
+            )
 
 
 def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill():
@@ -357,9 +379,10 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
         ),
     ]
     prefix_keys = [
-        scheduler._block_key(block_hash)
-        for block_hash in generated_hashes(
-            scheduler.hash_block_size, requests[0].all_token_ids, b"seed"
+        *generated_hashes(
+            scheduler.hash_block_size,
+            requests[0].all_token_ids,
+            b"seed",
         )[:2]
     ]
     for i, key in enumerate(prefix_keys):
@@ -412,20 +435,28 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
     assert isinstance(first_metadata, UCMFAWAConnectorMetadata)
     for request in requests:
         request_meta = first_metadata.request_meta[request.request_id]
-        assert request_meta.load_block_ids[0] == prefix_keys
-        assert request_meta.dump_block_ids == ([], [])
+        assert request_meta.load_block_plan is not None
+        assert request_meta.load_block_plan.keys == prefix_keys
+        assert request_meta.load_block_plan.indices == (0, 1)
+        assert request_meta.dump_block_plan is None
 
     for worker in workers:
         bind_and_register(worker, first_metadata)
         worker.start_load_kv(None)
         for request in requests:
-            rows = first_metadata.request_meta[request.request_id].load_block_ids[1]
+            rows = load_block_ids(
+                worker,
+                first_metadata.request_meta[request.request_id],
+            )[1]
             assert row_bytes(worker, fa_store, rows, worker.fa_group_ids) == [
                 fa_store.stored_bytes(key) for key in prefix_keys
             ]
-            assert row_bytes(worker, wa_store, rows[-1:], worker.window_group_ids) == [
-                wa_store.stored_bytes(prefix_keys[-1])
-            ]
+            assert row_bytes(
+                worker,
+                wa_store,
+                rows[-1:],
+                worker._active_store_window_group_ids(),
+            ) == [wa_store.stored_bytes(prefix_keys[-1])]
 
     first_deltas = {}
     second_deltas = {}
@@ -452,10 +483,7 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
         )
     )
     for request in requests:
-        assert partial_metadata.request_meta[request.request_id].dump_block_ids == (
-            [],
-            [],
-        )
+        assert partial_metadata.request_meta[request.request_id].dump_block_plan is None
 
     final_metadata = scheduler.build_connector_meta(
         FakeSchedulerOutput(
@@ -471,25 +499,25 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
     )
     expected_dump_keys = {
         request.request_id: [
-            scheduler._block_key(block_hash)
-            for block_hash in generated_hashes(
-                scheduler.hash_block_size, request.all_token_ids, b"seed"
+            *generated_hashes(
+                scheduler.hash_block_size,
+                request.all_token_ids,
+                b"seed",
             )[2:4]
         ]
         for request in requests
     }
     for request in requests:
-        assert (
-            final_metadata.request_meta[request.request_id].dump_block_ids[0]
-            == expected_dump_keys[request.request_id]
-        )
+        dump_plan = final_metadata.request_meta[request.request_id].dump_block_plan
+        assert dump_plan is not None
+        assert dump_plan.keys == expected_dump_keys[request.request_id]
 
     rank0 = workers[0]
     bind_and_register(rank0, final_metadata)
     for request_meta in final_metadata.request_meta.values():
-        dump_rows = request_meta.dump_block_ids[1]
+        dump_rows = dump_block_ids(rank0, request_meta)[1]
         fill_rows(rank0, dump_rows, rank0.fa_group_ids, 0x91)
-        fill_rows(rank0, dump_rows, rank0.window_group_ids, 0xE1)
+        fill_rows(rank0, dump_rows, rank0._active_store_window_group_ids(), 0xE1)
     before_dump_count = len(fa_store.dump_history)
     for worker in workers[1:]:
         bind_and_register(worker, final_metadata)
@@ -510,7 +538,7 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
         assert set(fa_store.stored_bytes(key)) == {0x91}
         assert set(wa_store.stored_bytes(key)) == {0xE1}
 
-    req_a_rows = scheduler.requests_meta["req-a"].group_block_ids
+    req_a_rows = materialize_rows(scheduler, scheduler.requests_meta["req-a"], range(4))
     assert req_a_rows[0][3][0].block_id == req_a_rows[3][3][0].block_id
     assert [req_a_rows[i][3][0].offset for i in range(4)] == [0, 512, 1024, 1536]
     assert req_a_rows[0][8][0].block_id == req_a_rows[3][8][0].block_id

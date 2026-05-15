@@ -17,6 +17,7 @@ from ucm.integration.vllm.hma_connector import UCMAscendFAWAConnector
 
 REQUEST_COUNT = 128
 INPUT_TOKENS = 1024 * 1024
+CHUNK_PREFILL_TOKENS = 4 * 1024
 HASH_BLOCK_SIZE = 256
 WINDOW_BLOCK_SIZE = 64
 CANONICAL_BLOCKS = INPUT_TOKENS // HASH_BLOCK_SIZE
@@ -528,7 +529,7 @@ def run_chunk_prefill_dump_case(request_count: int) -> dict[str, object]:
 
     metadata, build_meta_ms = elapsed_ms(
         lambda: connector.build_connector_meta(
-            new_scheduler_output(requests, scheduled_tokens=INPUT_TOKENS)
+            new_scheduler_output(requests, scheduled_tokens=CHUNK_PREFILL_TOKENS)
         )
     )
     connector.bind_connector_metadata(metadata)
@@ -539,6 +540,8 @@ def run_chunk_prefill_dump_case(request_count: int) -> dict[str, object]:
         "case": "chunk_prefill_dump",
         "request_count": request_count,
         "input_tokens": INPUT_TOKENS,
+        "chunk_prefill_tokens": CHUNK_PREFILL_TOKENS,
+        "chunk_count": 1,
         "canonical_blocks_per_request": CANONICAL_BLOCKS,
         "timing_ms": {
             "get_num_new_matched_tokens": get_num_ms,
@@ -579,7 +582,7 @@ def run_ascend_chunk_prefill_dump_case(request_count: int) -> dict[str, object]:
 
     metadata, build_meta_ms = elapsed_ms(
         lambda: connector.build_connector_meta(
-            new_scheduler_output(requests, scheduled_tokens=INPUT_TOKENS)
+            new_scheduler_output(requests, scheduled_tokens=CHUNK_PREFILL_TOKENS)
         )
     )
     connector.bind_connector_metadata(metadata)
@@ -590,6 +593,8 @@ def run_ascend_chunk_prefill_dump_case(request_count: int) -> dict[str, object]:
         "case": "ascend_chunk_prefill_dump",
         "request_count": request_count,
         "input_tokens": INPUT_TOKENS,
+        "chunk_prefill_tokens": CHUNK_PREFILL_TOKENS,
+        "chunk_count": 1,
         "canonical_blocks_per_request": ASCEND_CANONICAL_BLOCKS,
         "timing_ms": {
             "get_num_new_matched_tokens": get_num_ms,
@@ -633,12 +638,22 @@ def test_hma_fawa_connector_runtime_metadata_perf():
     expected_ascend_rows = request_count * ASCEND_CANONICAL_BLOCKS
     assert prefix_hit["fa_store"]["load_key_count"] == expected_rows
     assert prefix_hit["wa_store"]["load_key_count"] == request_count
-    assert chunk_prefill["fa_store"]["dump_key_count"] == expected_rows
-    assert chunk_prefill["wa_store"]["dump_key_count"] == expected_rows
+    expected_chunk_rows = request_count * (CHUNK_PREFILL_TOKENS // HASH_BLOCK_SIZE)
+    expected_ascend_chunk_rows = request_count * (
+        CHUNK_PREFILL_TOKENS // ASCEND_HASH_BLOCK_SIZE
+    )
+    assert chunk_prefill["fa_store"]["dump_key_count"] == expected_chunk_rows
+    assert chunk_prefill["wa_store"]["dump_key_count"] == expected_chunk_rows
     assert ascend_prefix_hit["fa_store"]["load_key_count"] == expected_ascend_rows
     assert ascend_prefix_hit["wa_store"]["load_key_count"] == request_count
-    assert ascend_chunk_prefill["fa_store"]["dump_key_count"] == expected_ascend_rows
-    assert ascend_chunk_prefill["wa_store"]["dump_key_count"] == expected_ascend_rows
+    assert (
+        ascend_chunk_prefill["fa_store"]["dump_key_count"]
+        == expected_ascend_chunk_rows
+    )
+    assert (
+        ascend_chunk_prefill["wa_store"]["dump_key_count"]
+        == expected_ascend_chunk_rows
+    )
 
     print(
         "\nUCMFAWAConnector metadata perf summary:\n"
