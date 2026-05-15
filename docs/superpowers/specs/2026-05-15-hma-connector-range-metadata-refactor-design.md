@@ -63,18 +63,29 @@ Field contracts:
 - `load_vllm_block_ids` and `dump_vllm_block_ids` are tuples aligned by global
   KV cache group id. `candidate_vllm_ids[group_id]` directly addresses that
   group.
-- Each group candidate list is already sliced to the same hash range as the
+- Each FA group candidate list is already sliced to the same hash range as the
   corresponding keys. It contains the minimum physical vLLM block ids needed to
   cover the range.
+- Each WA group candidate list is sliced further to only the tail blocks needed
+  for each hash block in the range. It does not carry all logical WA blocks in
+  the hash block.
+- For WA load, `load_vllm_block_ids` carries only the final boundary hash block's
+  WA tail blocks. FA groups still cover the full load hash range.
+- For WA dump, `dump_vllm_block_ids` carries the WA tail blocks for every hash
+  block in the dump range.
+- WA/state groups with `tail_blocks == 0`, such as 128A state cache groups, use
+  an empty candidate list for that group.
 - New requests provide complete `request.block_ids`.
 - Cached and chunk-prefill requests provide incremental `new_block_ids`.
 - The connector accumulates block ids in `req_meta.vllm_block_ids`.
 - `update_state_after_alloc()` does not participate in the new logic and should
   remain a lifecycle no-op.
 
-`start_load_kv()` handles the WA load special case before calling `_extract_wa_ptr()`:
-it slices the load metadata down to `[load_hash_end - 1, load_hash_end)` so
-`_extract_wa_ptr()` receives candidate ids whose base matches the passed range.
+`build_connector_meta()` handles the WA load special case when building
+`load_vllm_block_ids`: FA groups use `[load_hash_start, load_hash_end)`, while WA
+groups use only `[load_hash_end - 1, load_hash_end)`. This keeps
+`_extract_wa_ptr()` simple because it receives only the final boundary's WA
+candidate ids for load.
 
 ## Group Metadata
 
@@ -110,7 +121,14 @@ Semantics:
 The scheduler should compute group candidate slices through one range-to-slice
 calculation rather than using `int(hash_idx * ratio)`. This prevents boundary
 errors for Ascend groups where multiple hash blocks share one physical tensor
-block.
+block. WA groups use a tail-slice variant of this calculation:
+
+- For each hash block, compute that hash block's logical WA block range.
+- Keep only the last `tail_blocks` physical blocks for the group.
+- If `tail_blocks == 0`, append no ids for that group.
+- For WA load, apply this only to the final loaded hash block.
+- For WA dump, apply this to every dumped hash block and concatenate the results
+  in hash block order.
 
 ## Worker Pointer Extraction
 
@@ -127,7 +145,10 @@ Both methods return a `np.uint64` pointer matrix with shape
 The extraction input contract is uniform:
 
 - `keys` correspond to `[hash_start, hash_end)`.
-- `candidate_vllm_ids` are sliced to `[hash_start, hash_end)`.
+- FA `candidate_vllm_ids` are sliced to `[hash_start, hash_end)`.
+- WA `candidate_vllm_ids` are sliced to the per-hash tail blocks for
+  `[hash_start, hash_end)`. Groups with zero tail blocks have empty candidate
+  lists.
 - The method does not need to know about a larger original range.
 
 Batch extraction should use only the values needed for pointer computation:
@@ -166,10 +187,11 @@ WA extraction:
 
 - Produces one store row per hash block in the passed range.
 - Includes all window groups.
-- For normal WA groups, each hash block maps to the last `tail_blocks` logical
-  group blocks in that hash block.
+- For normal WA groups, candidate ids already contain only the last `tail_blocks`
+  logical group blocks for each hash block.
 - For Ascend trimmed state groups, offsets point to the final `window_spans`
   portion of the tail block.
+- For zero-tail groups, no pointers are emitted for that group.
 
 ## FAWA Behavior
 
@@ -177,9 +199,11 @@ The refactor preserves the current FAWA store semantics:
 
 - FA load covers every external-hit hash block in `[load_hash_start, load_hash_end)`.
 - WA load covers only the final external-hit boundary
-  `[load_hash_end - 1, load_hash_end)`.
+  `[load_hash_end - 1, load_hash_end)`, and the WA candidate ids contain only
+  that boundary's tail blocks.
 - FA dump covers every hash block in `[dump_hash_start, dump_hash_end)`.
-- WA dump covers every hash block in `[dump_hash_start, dump_hash_end)`.
+- WA dump covers every hash block in `[dump_hash_start, dump_hash_end)`, and WA
+  candidate ids contain only each hash block's tail blocks.
 - Rank 0 owns dumping in `wait_for_save()`.
 - Nonzero TP ranks return from `wait_for_save()` without dumping.
 - `get_finished()` and `build_connector_worker_meta()` remain no-ops for this
@@ -206,6 +230,9 @@ should cover:
 - Flat `FAWARequestDispatchMeta` fields.
 - Global KV group id alignment for candidate tuples.
 - Range-to-candidate slicing for GPU FA, GPU WA, and Ascend compressed FA groups.
+- WA group candidate slicing that keeps only tail blocks per hash block.
+- WA load candidate slicing that keeps only the final boundary's tail blocks.
+- Zero-tail 128A state cache groups represented by empty candidate lists.
 - `_extract_fa_ptr()` producing correct pointers for Ascend shared tensor blocks.
 - `_extract_wa_ptr()` producing correct tail pointers for normal WA and Ascend
   trimmed state groups.
