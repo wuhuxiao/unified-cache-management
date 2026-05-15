@@ -1694,13 +1694,130 @@ class UCMFAWAConnector(UCMDirectConnector):
         the relation of hash_start, hash_end and candidate_vllm_ids can refer _generate_dispatch_meta func
         for each hash_block_idx, we can get the vllm block id and offset for each group's tensor
         """
-        pass
+        if not store_keys:
+            return np.empty((0, 0), dtype=np.uint64)
+
+        rows: list[list[np.ndarray]] = [[] for _ in store_keys]
+        for group_id in self.fa_group_ids:
+            layout = self.group_layouts.get(group_id)
+            if layout is None:
+                continue
+            meta = self.group_metas[group_id]
+            candidates = candidate_vllm_ids[group_id]
+            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
+            base_alloc_idx = (
+                hash_start * meta.logical_blocks_per_hash_block
+            ) // token_blocks_per_tensor_block
+
+            block_ids: list[int] = []
+            offsets: list[int] = []
+            for row_id, hash_idx in enumerate(range(hash_start, hash_end)):
+                logical_idx = hash_idx * meta.logical_blocks_per_hash_block
+                alloc_idx = logical_idx // token_blocks_per_tensor_block
+                candidate_idx = alloc_idx - base_alloc_idx
+                if candidate_idx < 0 or candidate_idx >= len(candidates):
+                    raise RuntimeError(
+                        f"FAWA FA pointer extraction missing candidate for "
+                        f"group={group_id}, hash={hash_idx}, "
+                        f"candidate_idx={candidate_idx}, "
+                        f"candidates={len(candidates)}."
+                    )
+                block_ids.append(candidates[candidate_idx])
+                offsets.append(
+                    (logical_idx % token_blocks_per_tensor_block)
+                    * meta.token_block_size
+                )
+
+            group_ptrs = layout.extract_segment_addrs_batch(
+                np.asarray(block_ids, dtype=np.int64),
+                np.asarray(offsets, dtype=np.int64),
+                meta.tensor_block_size,
+            )
+            for row_id, ptr_row in enumerate(group_ptrs):
+                rows[row_id].append(ptr_row)
+
+        if any(not row for row in rows):
+            raise ValueError("FA KV cache pointer row is empty.")
+        return np.vstack(
+            [
+                np.concatenate(row).astype(np.uint64, copy=False)
+                for row in rows
+            ]
+        )
 
     def _extract_wa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
         """
         samilar as _extract_fa_ptr, but for Ascend need to consider more
         """
-        pass
+        if not store_keys:
+            return np.empty((0, 0), dtype=np.uint64)
+
+        rows: list[list[np.ndarray]] = [[] for _ in store_keys]
+        for group_id in self.window_group_ids:
+            layout = self.group_layouts.get(group_id)
+            if layout is None:
+                continue
+            meta = self.group_metas[group_id]
+            if not meta.tail_blocks:
+                continue
+
+            candidates = candidate_vllm_ids[group_id]
+            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
+            candidate_base = 0
+            block_ids: list[int] = []
+            offsets: list[int] = []
+            row_ids: list[int] = []
+
+            for row_id, hash_idx in enumerate(range(hash_start, hash_end)):
+                logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
+                logical_start = max(
+                    hash_idx * meta.logical_blocks_per_hash_block,
+                    logical_end - meta.tail_blocks,
+                )
+                tail_alloc_start = logical_start // token_blocks_per_tensor_block
+                tail_alloc_end = (
+                    (logical_end - 1) // token_blocks_per_tensor_block
+                ) + 1
+                tail_candidate_count = tail_alloc_end - tail_alloc_start
+
+                for span_idx, span_tokens in enumerate(meta.window_spans):
+                    logical_idx = logical_end - len(meta.window_spans) + span_idx
+                    alloc_idx = logical_idx // token_blocks_per_tensor_block
+                    candidate_idx = candidate_base + alloc_idx - tail_alloc_start
+                    if candidate_idx < 0 or candidate_idx >= len(candidates):
+                        raise RuntimeError(
+                            f"FAWA WA pointer extraction missing candidate for "
+                            f"group={group_id}, hash={hash_idx}, "
+                            f"span_idx={span_idx}, "
+                            f"candidate_idx={candidate_idx}, "
+                            f"candidates={len(candidates)}."
+                        )
+                    block_ids.append(candidates[candidate_idx])
+                    offsets.append(
+                        (logical_idx % token_blocks_per_tensor_block)
+                        * meta.token_block_size
+                        + max(0, meta.token_block_size - span_tokens)
+                    )
+                    row_ids.append(row_id)
+
+                candidate_base += tail_candidate_count
+
+            group_ptrs = layout.extract_segment_addrs_batch(
+                np.asarray(block_ids, dtype=np.int64),
+                np.asarray(offsets, dtype=np.int64),
+                meta.tensor_block_size,
+            )
+            for row_id, ptr_row in zip(row_ids, group_ptrs):
+                rows[row_id].append(ptr_row)
+
+        if all(not row for row in rows):
+            raise ValueError("WA KV cache pointer row is empty.")
+        return np.vstack(
+            [
+                np.concatenate(row).astype(np.uint64, copy=False)
+                for row in rows
+            ]
+        )
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()

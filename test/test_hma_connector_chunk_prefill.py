@@ -304,6 +304,86 @@ def test_slice_group_block_ids_uses_tensor_block_ratio_for_large_blocks():
     ) == [101]
 
 
+def test_extract_fa_ptr_batches_hash_offsets_for_shared_tensor_block():
+    connector = make_connector()
+    connector.hash_block_size = 512
+    connector.fa_group_ids = (0,)
+    connector.window_group_ids = ()
+    connector.group_token_block_sizes = (512,)
+    connector.group_tensor_block_sizes = (4096,)
+    connector.group_tensor_block_ratios = (8,)
+    connector.group_tail_blocks = (None,)
+    connector.group_window_spans = ((512,),)
+    connector._init_group_metas()
+    tensor = torch.empty((5, 4096, 1), dtype=torch.float32)
+    connector.group_layouts = {0: KVCacheGroupLayout({"layer.0": tensor})}
+
+    ptrs = connector._extract_fa_ptr(
+        [b"a", b"b"],
+        7,
+        9,
+        ([3, 4],),
+    )
+
+    assert ptrs.shape == (2, 1)
+    assert ptrs[0, 0] == np.uint64(tensor[3, 3584].data_ptr())
+    assert ptrs[1, 0] == np.uint64(tensor[4, 0].data_ptr())
+
+
+def test_extract_wa_ptr_uses_tail_candidates_and_zero_tail_group():
+    connector = make_connector()
+    connector.group_token_block_sizes = (256, 64, 64)
+    connector.group_tensor_block_sizes = connector.group_token_block_sizes
+    connector.group_tensor_block_ratios = (1, 1, 1)
+    connector.fa_group_ids = (0,)
+    connector.window_group_ids = (1, 2)
+    connector.group_tail_blocks = (None, 1, 0)
+    connector.group_window_spans = ((256,), (64,), ())
+    connector._init_group_metas()
+    window_tensor = torch.empty((16, 64, 1), dtype=torch.float32)
+    zero_tail_tensor = torch.empty((16, 64, 1), dtype=torch.float32)
+    connector.group_layouts = {
+        1: KVCacheGroupLayout({"layer.0.wa": window_tensor}),
+        2: KVCacheGroupLayout({"layer.0.zero": zero_tail_tensor}),
+    }
+
+    ptrs = connector._extract_wa_ptr(
+        [b"a", b"b"],
+        0,
+        2,
+        ([], [3, 7], []),
+    )
+
+    assert ptrs.shape == (2, 1)
+    assert ptrs[0, 0] == np.uint64(window_tensor[3, 0].data_ptr())
+    assert ptrs[1, 0] == np.uint64(window_tensor[7, 0].data_ptr())
+
+
+def test_extract_wa_ptr_offsets_trimmed_window_span_to_tail_start():
+    connector = make_connector()
+    connector.hash_block_size = 32
+    connector.group_token_block_sizes = (32, 32)
+    connector.group_tensor_block_sizes = connector.group_token_block_sizes
+    connector.group_tensor_block_ratios = (1, 1)
+    connector.fa_group_ids = (0,)
+    connector.window_group_ids = (1,)
+    connector.group_tail_blocks = (None, 1)
+    connector.group_window_spans = ((32,), (4,))
+    connector._init_group_metas()
+    tensor = torch.empty((8, 32, 1), dtype=torch.float32)
+    connector.group_layouts = {1: KVCacheGroupLayout({"layer.0.wa": tensor})}
+
+    ptrs = connector._extract_wa_ptr(
+        [b"a"],
+        0,
+        1,
+        ([], [5]),
+    )
+
+    assert ptrs.shape == (1, 1)
+    assert ptrs[0, 0] == np.uint64(tensor[5, 28].data_ptr())
+
+
 class FakeStore:
     def __init__(self, hit_index: int, lookup_hits: list[bool] | None = None):
         self.hit_index = hit_index
