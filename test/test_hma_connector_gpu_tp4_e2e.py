@@ -53,7 +53,6 @@ from vllm.v1.worker.gpu.attn_utils import get_kv_cache_spec
 from ucm.integration.vllm.hma_connector import (
     FAWARequestDispatchMeta,
     KVCacheGroupLayout,
-    KVCacheGroupRows,
     UCMFAWAConnector,
     UCMFAWAConnectorMetadata,
 )
@@ -192,11 +191,37 @@ class TensorRegistry:
             for tensor in layout.view_tensors:
                 self.by_ptr[int(tensor.data_ptr())] = tensor
 
+    def _view_for_ptr(self, ptr: int, size: int) -> torch.Tensor:
+        for base_ptr, tensor in self.by_ptr.items():
+            storage = tensor.untyped_storage()
+            storage_ptr = int(storage.data_ptr())
+            if storage_ptr <= ptr and ptr + size <= storage_ptr + storage.nbytes():
+                view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+                return view.set_(storage, ptr - storage_ptr, (size,), (1,))
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if tensor.is_contiguous() and base_ptr <= ptr and ptr + size <= (
+                base_ptr + tensor_bytes
+            ):
+                offset = ptr - base_ptr
+                return tensor.view(torch.uint8).narrow(0, offset, size)
+        raise KeyError(ptr)
+
     def row_bytes(self, ptr_row: Iterable[int]) -> bytes:
         return b"".join(
             self.by_ptr[int(ptr)].detach().cpu().reshape(-1).numpy().tobytes()
             for ptr in ptr_row
         )
+
+    def ptrs_bytes(self, ptr_row: Iterable[int], size_list: list[int]) -> bytes:
+        return b"".join(
+            self._view_for_ptr(int(ptr), int(size)).detach().cpu().numpy().tobytes()
+            for ptr, size in zip(ptr_row, size_list)
+        )
+
+    def fill_ptrs(self, ptrs: np.ndarray, size_list: list[int], value: int) -> None:
+        for ptr_row in np.asarray(ptrs, dtype=np.uint64):
+            for ptr, size in zip(ptr_row, size_list):
+                self._view_for_ptr(int(ptr), int(size)).fill_(value)
 
 
 def make_vllm_config(
@@ -532,6 +557,7 @@ def kv_cache_blocks(group_block_ids: tuple[list[int], ...]) -> KVCacheBlocks:
 def scheduler_output(
     *,
     new_req_ids: list[str] | None = None,
+    new_req_block_ids: dict[str, tuple[list[int], ...]] | None = None,
     cached_req_ids: list[str] | None = None,
     resumed_req_ids: set[str] | None = None,
     new_block_ids: list[tuple[list[int], ...] | None] | None = None,
@@ -539,11 +565,16 @@ def scheduler_output(
     finished_req_ids: set[str] | None = None,
 ) -> SchedulerOutput:
     new_req_ids = new_req_ids or []
+    new_req_block_ids = new_req_block_ids or {}
     cached_req_ids = cached_req_ids or []
     resumed_req_ids = resumed_req_ids or set()
     new_block_ids = new_block_ids or []
     num_scheduled_tokens = num_scheduled_tokens or {}
     finished_req_ids = finished_req_ids or set()
+    group_count = next(
+        (len(block_ids) for block_ids in new_req_block_ids.values()),
+        0,
+    )
     return SchedulerOutput(
         scheduled_new_reqs=[
             NewRequestData(
@@ -552,7 +583,10 @@ def scheduler_output(
                 mm_features=[],
                 sampling_params=None,
                 pooling_params=None,
-                block_ids=([],),
+                block_ids=new_req_block_ids.get(
+                    req_id,
+                    tuple([] for _ in range(group_count)),
+                ),
                 num_computed_tokens=0,
                 lora_request=None,
             )
@@ -577,45 +611,31 @@ def scheduler_output(
     )
 
 
-def fill_rows(
+def ptr_size_list(
     worker: UCMFAWAConnector,
-    group_rows: KVCacheGroupRows,
     group_ids: tuple[int, ...],
-    value: int,
-) -> None:
-    for selected_row in worker._select_rows(group_rows, group_ids):
-        for selected_group, group_id in zip(selected_row, group_ids):
-            layout = worker.group_layouts.get(group_id)
-            if layout is None or not selected_group:
-                continue
-            for view in layout.extract_segment_tensor_views(
-                selected_group,
-                worker.group_tensor_block_sizes[group_id],
-            ):
-                view.fill_(value)
+) -> list[int]:
+    return worker._store_tensor_size_list(worker.group_layouts, group_ids)
 
 
-def selected_row_bytes(
+def fill_ptrs(
     worker: UCMFAWAConnector,
     registry: TensorRegistry,
-    group_rows: KVCacheGroupRows,
     group_ids: tuple[int, ...],
+    ptrs: np.ndarray,
+    value: int,
+) -> None:
+    registry.fill_ptrs(ptrs, ptr_size_list(worker, group_ids), value)
+
+
+def ptr_row_bytes(
+    worker: UCMFAWAConnector,
+    registry: TensorRegistry,
+    group_ids: tuple[int, ...],
+    ptrs: np.ndarray,
 ) -> list[bytes]:
-    del registry
-    rows: list[bytes] = []
-    for selected_row in worker._select_rows(group_rows, group_ids):
-        chunks: list[bytes] = []
-        for selected_group, group_id in zip(selected_row, group_ids):
-            layout = worker.group_layouts.get(group_id)
-            if layout is None or not selected_group:
-                continue
-            for view in layout.extract_segment_tensor_views(
-                selected_group,
-                worker.group_tensor_block_sizes[group_id],
-            ):
-                chunks.append(view.detach().cpu().reshape(-1).numpy().tobytes())
-        rows.append(b"".join(chunks))
-    return rows
+    sizes = ptr_size_list(worker, group_ids)
+    return [registry.ptrs_bytes(ptr_row, sizes) for ptr_row in ptrs]
 
 
 def wrap_store(
@@ -718,6 +738,7 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     producer_metadata = scheduler_wrapper.build_connector_meta(
         scheduler_output(
             new_req_ids=[producer.request_id],
+            new_req_block_ids={producer.request_id: producer_alloc},
             num_scheduled_tokens={
                 producer.request_id: len(producer.all_token_ids),
             },
@@ -725,31 +746,55 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     )
     assert isinstance(producer_metadata, UCMFAWAConnectorMetadata)
     producer_dispatch = producer_metadata.request_meta[producer.request_id]
-    assert producer_dispatch.load_block_ids == ([], [])
-    assert producer_dispatch.dump_block_ids[0] == prefix_keys
+    assert producer_dispatch.load_keys == []
+    assert producer_dispatch.load_hash_start == 0
+    assert producer_dispatch.load_hash_end == 0
+    assert producer_dispatch.dump_keys == prefix_keys
+    assert producer_dispatch.dump_hash_end > producer_dispatch.dump_hash_start
+    assert len(producer_dispatch.dump_vllm_block_ids) == len(
+        scheduler.group_token_block_sizes
+    )
 
     seeded_fa_bytes: dict[bytes, bytes] = {}
     seeded_wa_bytes: dict[bytes, bytes] = {}
-    producer_rows = producer_dispatch.dump_block_ids[1]
-    for idx, key in enumerate(producer_dispatch.dump_block_ids[0]):
-        fill_rows(rank0, producer_rows[idx : idx + 1], rank0.fa_group_ids, 0x21 + idx)
-        fill_rows(
+    producer_fa_ptrs = rank0._extract_fa_ptr(
+        producer_dispatch.dump_keys,
+        producer_dispatch.dump_hash_start,
+        producer_dispatch.dump_hash_end,
+        producer_dispatch.dump_vllm_block_ids,
+    )
+    producer_wa_ptrs = rank0._extract_wa_ptr(
+        producer_dispatch.dump_keys,
+        producer_dispatch.dump_hash_start,
+        producer_dispatch.dump_hash_end,
+        producer_dispatch.dump_vllm_block_ids,
+    )
+    for idx, key in enumerate(producer_dispatch.dump_keys):
+        fill_ptrs(
             rank0,
-            producer_rows[idx : idx + 1],
+            registries[0],
+            rank0.fa_group_ids,
+            producer_fa_ptrs[idx : idx + 1],
+            0x21 + idx,
+        )
+        fill_ptrs(
+            rank0,
+            registries[0],
             rank0.window_group_ids,
+            producer_wa_ptrs[idx : idx + 1],
             0x61 + idx,
         )
-        seeded_fa_bytes[key] = selected_row_bytes(
+        seeded_fa_bytes[key] = ptr_row_bytes(
             rank0,
             registries[0],
-            producer_rows[idx : idx + 1],
             rank0.fa_group_ids,
+            producer_fa_ptrs[idx : idx + 1],
         )[0]
-        seeded_wa_bytes[key] = selected_row_bytes(
+        seeded_wa_bytes[key] = ptr_row_bytes(
             rank0,
             registries[0],
-            producer_rows[idx : idx + 1],
             rank0.window_group_ids,
+            producer_wa_ptrs[idx : idx + 1],
         )[0]
 
     before_rank0_dump_count = len(cast(CapturingStore, rank0.fa_store).dump_history)
@@ -811,16 +856,28 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     first_metadata = scheduler_wrapper.build_connector_meta(
         scheduler_output(
             new_req_ids=[request.request_id for request in requests],
+            new_req_block_ids={
+                request.request_id: initial_allocs[request.request_id]
+                for request in requests
+            },
             num_scheduled_tokens={
-                request.request_id: scheduler.hash_block_size for request in requests
+                request.request_id: 0 for request in requests
             },
         )
     )
     assert isinstance(first_metadata, UCMFAWAConnectorMetadata)
     for request in requests:
         dispatch = first_metadata.request_meta[request.request_id]
-        assert dispatch.load_block_ids[0] == prefix_keys
-        assert dispatch.dump_block_ids == ([], [])
+        assert dispatch.load_keys == prefix_keys
+        assert dispatch.load_hash_end - dispatch.load_hash_start == len(prefix_keys)
+        assert dispatch.dump_keys == []
+        assert dispatch.dump_hash_end == dispatch.dump_hash_start
+        for group_id in scheduler.window_group_ids:
+            tail_blocks = scheduler.group_metas[group_id].tail_blocks
+            if tail_blocks == 0:
+                assert dispatch.load_vllm_block_ids[group_id] == []
+            else:
+                assert len(dispatch.load_vllm_block_ids[group_id]) == tail_blocks
 
     for wrapper, worker, registry in zip(worker_wrappers, worker_connectors, registries):
         wrapper.bind_connector_metadata(first_metadata)
@@ -830,17 +887,29 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
         fa_store = cast(CapturingStore, worker.fa_store)
         wa_store = cast(CapturingStore, worker.wa_store)
         for request in requests:
-            rows = first_metadata.request_meta[request.request_id].load_block_ids[1]
+            request_meta = first_metadata.request_meta[request.request_id]
+            fa_ptrs = worker._extract_fa_ptr(
+                request_meta.load_keys,
+                request_meta.load_hash_start,
+                request_meta.load_hash_end,
+                request_meta.load_vllm_block_ids,
+            )
+            wa_ptrs = worker._extract_wa_ptr(
+                request_meta.load_keys[-1:],
+                request_meta.load_hash_end - 1,
+                request_meta.load_hash_end,
+                request_meta.load_vllm_block_ids,
+            )
             assert fa_store.load_history[-2:] or fa_store.load_history
             assert wa_store.load_history[-2:] or wa_store.load_history
-            assert selected_row_bytes(worker, registry, rows, worker.fa_group_ids) == [
+            assert ptr_row_bytes(worker, registry, worker.fa_group_ids, fa_ptrs) == [
                 seeded_fa_bytes[key] for key in prefix_keys
             ]
-            assert selected_row_bytes(
+            assert ptr_row_bytes(
                 worker,
                 registry,
-                rows[-1:],
                 worker.window_group_ids,
+                wa_ptrs,
             ) == [
                 seeded_wa_bytes[prefix_keys[-1]]
             ]
@@ -873,8 +942,16 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     assert isinstance(resumed_metadata, UCMFAWAConnectorMetadata)
     for request in requests:
         dispatch = resumed_metadata.request_meta[request.request_id]
-        assert dispatch.load_block_ids[0] == prefix_keys
-        assert dispatch.dump_block_ids == ([], [])
+        assert dispatch.load_keys == prefix_keys
+        assert dispatch.load_hash_end - dispatch.load_hash_start == len(prefix_keys)
+        assert dispatch.dump_keys == []
+        assert dispatch.dump_hash_end == dispatch.dump_hash_start
+        for group_id in scheduler.window_group_ids:
+            tail_blocks = scheduler.group_metas[group_id].tail_blocks
+            if tail_blocks == 0:
+                assert dispatch.load_vllm_block_ids[group_id] == []
+            else:
+                assert len(dispatch.load_vllm_block_ids[group_id]) == tail_blocks
 
     for wrapper, worker, registry in zip(worker_wrappers, worker_connectors, registries):
         wrapper.handle_preemptions(resumed_metadata)
@@ -883,15 +960,27 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
         fa_store = cast(CapturingStore, worker.fa_store)
         wa_store = cast(CapturingStore, worker.wa_store)
         for request in requests:
-            rows = resumed_metadata.request_meta[request.request_id].load_block_ids[1]
-            assert selected_row_bytes(worker, registry, rows, worker.fa_group_ids) == [
+            request_meta = resumed_metadata.request_meta[request.request_id]
+            fa_ptrs = worker._extract_fa_ptr(
+                request_meta.load_keys,
+                request_meta.load_hash_start,
+                request_meta.load_hash_end,
+                request_meta.load_vllm_block_ids,
+            )
+            wa_ptrs = worker._extract_wa_ptr(
+                request_meta.load_keys[-1:],
+                request_meta.load_hash_end - 1,
+                request_meta.load_hash_end,
+                request_meta.load_vllm_block_ids,
+            )
+            assert ptr_row_bytes(worker, registry, worker.fa_group_ids, fa_ptrs) == [
                 seeded_fa_bytes[key] for key in prefix_keys
             ]
-            assert selected_row_bytes(
+            assert ptr_row_bytes(
                 worker,
                 registry,
-                rows[-1:],
                 worker.window_group_ids,
+                wa_ptrs,
             ) == [
                 seeded_wa_bytes[prefix_keys[-1]]
             ]
@@ -925,10 +1014,9 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     )
     assert isinstance(partial_metadata, UCMFAWAConnectorMetadata)
     for request in requests:
-        assert partial_metadata.request_meta[request.request_id].dump_block_ids == (
-            [],
-            [],
-        )
+        request_meta = partial_metadata.request_meta[request.request_id]
+        assert request_meta.dump_keys == []
+        assert request_meta.dump_hash_end == request_meta.dump_hash_start
 
     # Stage 5: the next scheduler tick delivers the remaining group allocations.
     # Only contiguous complete canonical rows beyond the external hit boundary
@@ -956,32 +1044,46 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
         for request in requests
     }
     for request in requests:
-        assert (
-            final_metadata.request_meta[request.request_id].dump_block_ids[0]
-            == expected_dump_keys[request.request_id]
-        )
+        request_meta = final_metadata.request_meta[request.request_id]
+        assert request_meta.dump_keys == expected_dump_keys[request.request_id]
+        assert request_meta.dump_hash_end >= request_meta.dump_hash_start
+        for group_id in scheduler.window_group_ids:
+            tail_blocks = scheduler.group_metas[group_id].tail_blocks
+            expected = 0 if tail_blocks == 0 else tail_blocks * len(request_meta.dump_keys)
+            assert len(request_meta.dump_vllm_block_ids[group_id]) == expected
 
     rank0 = worker_connectors[0]
     rank0_wrapper.bind_connector_metadata(final_metadata)
     expected_fa_bytes: dict[bytes, bytes] = {}
     expected_wa_bytes: dict[bytes, bytes] = {}
     for request_meta in final_metadata.request_meta.values():
-        dump_keys = request_meta.dump_block_ids[0]
-        dump_rows = request_meta.dump_block_ids[1]
-        fill_rows(rank0, dump_rows, rank0.fa_group_ids, 0xA1)
-        fill_rows(rank0, dump_rows, rank0.window_group_ids, 0xD1)
+        dump_keys = request_meta.dump_keys
+        fa_ptrs = rank0._extract_fa_ptr(
+            dump_keys,
+            request_meta.dump_hash_start,
+            request_meta.dump_hash_end,
+            request_meta.dump_vllm_block_ids,
+        )
+        wa_ptrs = rank0._extract_wa_ptr(
+            dump_keys,
+            request_meta.dump_hash_start,
+            request_meta.dump_hash_end,
+            request_meta.dump_vllm_block_ids,
+        )
+        fill_ptrs(rank0, registries[0], rank0.fa_group_ids, fa_ptrs, 0xA1)
+        fill_ptrs(rank0, registries[0], rank0.window_group_ids, wa_ptrs, 0xD1)
         for key, row_bytes_value in zip(
             dump_keys,
-            selected_row_bytes(rank0, registries[0], dump_rows, rank0.fa_group_ids),
+            ptr_row_bytes(rank0, registries[0], rank0.fa_group_ids, fa_ptrs),
         ):
             expected_fa_bytes[key] = row_bytes_value
         for key, row_bytes_value in zip(
             dump_keys,
-            selected_row_bytes(
+            ptr_row_bytes(
                 rank0,
                 registries[0],
-                dump_rows,
                 rank0.window_group_ids,
+                wa_ptrs,
             ),
         ):
             expected_wa_bytes[key] = row_bytes_value
@@ -1006,8 +1108,16 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     fa_store = cast(CapturingStore, rank0.fa_store)
     wa_store = cast(CapturingStore, rank0.wa_store)
     expected_flat_keys = expected_dump_keys["req-gpu-a"] + expected_dump_keys["req-gpu-b"]
-    assert fa_store.dump_history[-2] + fa_store.dump_history[-1] == expected_flat_keys
-    assert wa_store.dump_history[-2] + wa_store.dump_history[-1] == expected_flat_keys
+    assert [
+        key
+        for history in fa_store.dump_history[before_dump_count:]
+        for key in history
+    ] == expected_flat_keys
+    assert [
+        key
+        for history in wa_store.dump_history[before_dump_count:]
+        for key in history
+    ] == expected_flat_keys
     wait_lookup_on_prefix(
         scheduler.fa_store,
         expected_flat_keys,
