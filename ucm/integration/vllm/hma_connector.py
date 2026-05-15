@@ -1127,19 +1127,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                 spans.append((self.group_token_block_sizes[group_id],) * tail_blocks)
         return tuple(spans)
 
-    def _group_block_range(self, group_id: int, computed_end_token: int) -> range:
-        group_token_block_size = self.group_token_block_sizes[group_id]
-        end_block = math.ceil(computed_end_token / group_token_block_size)
-        tail_blocks = self.group_tail_blocks[group_id]
-        if tail_blocks is None:
-            start_token = max(0, computed_end_token - self.hash_block_size)
-            start_block = start_token // group_token_block_size
-        elif tail_blocks == 0:
-            return range(0, 0)
-        else:
-            start_block = max(0, end_block - tail_blocks)
-        return range(start_block, end_block)
-
     @staticmethod
     def _is_compressor_state_name(layer_name: str) -> bool:
         return ".compressor.state_cache" in layer_name
@@ -1472,57 +1459,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
         return group_block_ids[alloc_start:alloc_end]
 
-    def _expected_candidate_count(
-        self,
-        group_id: int,
-        hash_start: int,
-        hash_end: int,
-        *,
-        window_tail_only: bool,
-    ) -> int:
-        if hash_end <= hash_start:
-            return 0
-        meta = self.group_metas[group_id]
-        token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
-        if window_tail_only:
-            if not meta.tail_blocks:
-                return 0
-            expected = 0
-            for hash_idx in range(hash_start, hash_end):
-                logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
-                logical_start = max(
-                    hash_idx * meta.logical_blocks_per_hash_block,
-                    logical_end - meta.tail_blocks,
-                )
-                alloc_start = logical_start // token_blocks_per_tensor_block
-                alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-                expected += alloc_end - alloc_start
-            return expected
-
-        alloc_start = (
-            hash_start * meta.logical_blocks_per_hash_block
-        ) // token_blocks_per_tensor_block
-        logical_end = hash_end * meta.logical_blocks_per_hash_block
-        alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-        return alloc_end - alloc_start
-
-    def _has_complete_candidate_range(
-        self,
-        candidate_vllm_ids: list[list[int]],
-        hash_start: int,
-        hash_end: int,
-    ) -> bool:
-        for group_id, candidates in enumerate(candidate_vllm_ids):
-            expected = self._expected_candidate_count(
-                group_id,
-                hash_start,
-                hash_end,
-                window_tail_only=group_id in self.window_group_ids,
-            )
-            if len(candidates) != expected:
-                return False
-        return True
-
     def _generate_dispatch_meta(
         self,
         req_meta: FAWARequestMeta,
@@ -1580,6 +1516,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         dump_block_keys: list[bytes] = []
         dump_vllm_block_ids: list[list[int]] = []
         if dump_end > dump_start:
+            dump_block_keys = req_meta.ucm_block_ids[dump_start:dump_end]
             for group_id, group_block_ids in enumerate(all_group_block_ids):
                 dump_vllm_block_ids.append(
                     self._slice_group_block_ids(
@@ -1590,16 +1527,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                         window_tail_only=group_id in self.window_group_ids,
                     )
                 )
-            if self._has_complete_candidate_range(
-                dump_vllm_block_ids,
-                dump_start,
-                dump_end,
-            ):
-                dump_block_keys = req_meta.ucm_block_ids[dump_start:dump_end]
-            else:
-                dump_vllm_block_ids = []
-                computed_end_token = req_meta.token_processed
-                dump_end = dump_start
         req_meta.token_processed = computed_end_token
 
         return FAWARequestDispatchMeta(
@@ -2116,27 +2043,6 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
                 window_tail_tokens -= segment_tokens
             spans.append(tuple(reversed(group_spans)))
         return tuple(spans)
-
-    def _group_block_range(self, group_id: int, computed_end_token: int) -> range:
-        if (
-            self.group_tail_blocks[group_id] is None
-            or self.group_tail_blocks[group_id] == 0
-            or self.block_span_layout.is_swa_group(group_id)
-        ):
-            return super()._group_block_range(group_id, computed_end_token)
-
-        window_tail_tokens = self._ascend_window_tail_tokens(group_id)
-        if window_tail_tokens is None:
-            return super()._group_block_range(group_id, computed_end_token)
-        if window_tail_tokens == 0:
-            return range(0, 0)
-
-        group_token_block_size = self.group_token_block_sizes[group_id]
-        tail_end_token = computed_end_token
-        tail_start_token = max(0, tail_end_token - window_tail_tokens)
-        start_block = tail_start_token // group_token_block_size
-        end_block = math.ceil(tail_end_token / group_token_block_size)
-        return range(start_block, end_block)
 
     def _block_index_to_segment(
         self,

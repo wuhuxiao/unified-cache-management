@@ -152,7 +152,7 @@ def build_allocation(
         max_tensor_idx = -1
         for canonical_idx in range(canonical_blocks):
             computed_end = (canonical_idx + 1) * connector.hash_block_size
-            for group_block_idx in connector._group_block_range(group_id, computed_end):
+            for group_block_idx in group_block_range(connector, group_id, computed_end):
                 tensor_idx = connector.block_span_layout.allocation_index(
                     group_id,
                     group_block_idx,
@@ -160,6 +160,55 @@ def build_allocation(
                 max_tensor_idx = max(max_tensor_idx, tensor_idx)
         allocation.append([base_block_id + idx for idx in range(max_tensor_idx + 1)])
     return tuple(allocation)
+
+
+def group_block_range(
+    connector: UCMFAWAConnector,
+    group_id: int,
+    computed_end_token: int,
+) -> range:
+    group_token_block_size = connector.group_token_block_sizes[group_id]
+    end_block = math.ceil(computed_end_token / group_token_block_size)
+    tail_blocks = connector.group_tail_blocks[group_id]
+    if tail_blocks is None:
+        start_token = max(0, computed_end_token - connector.hash_block_size)
+        start_block = start_token // group_token_block_size
+    elif tail_blocks == 0:
+        return range(0, 0)
+    else:
+        start_block = max(0, end_block - tail_blocks)
+    return range(start_block, end_block)
+
+
+def dump_candidate_count(
+    connector: UCMFAWAConnector,
+    group_id: int,
+    hash_start: int,
+    hash_end: int,
+) -> int:
+    meta = connector.group_metas[group_id]
+    token_blocks_per_tensor_block = connector._group_tensor_block_ratio(group_id)
+    if group_id in connector.window_group_ids:
+        if not meta.tail_blocks:
+            return 0
+        expected = 0
+        for hash_idx in range(hash_start, hash_end):
+            logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
+            logical_start = max(
+                hash_idx * meta.logical_blocks_per_hash_block,
+                logical_end - meta.tail_blocks,
+            )
+            alloc_start = logical_start // token_blocks_per_tensor_block
+            alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
+            expected += alloc_end - alloc_start
+        return expected
+
+    alloc_start = (
+        hash_start * meta.logical_blocks_per_hash_block
+    ) // token_blocks_per_tensor_block
+    logical_end = hash_end * meta.logical_blocks_per_hash_block
+    alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
+    return alloc_end - alloc_start
 
 
 def allocation_delta(
@@ -170,18 +219,6 @@ def allocation_delta(
         list(target_group[len(current_group) :])
         for current_group, target_group in zip(current, target)
     )
-
-
-def split_delta_first_group(
-    delta: tuple[list[int], ...],
-) -> tuple[tuple[list[int], ...], tuple[list[int], ...]]:
-    first = tuple(
-        list(group) if group_id == 0 else [] for group_id, group in enumerate(delta)
-    )
-    second = tuple(
-        [] if group_id == 0 else list(group) for group_id, group in enumerate(delta)
-    )
-    return first, second
 
 
 def make_layouts(
@@ -400,16 +437,24 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
                 == expected_wa
             )
 
+    third_block_allocs = {
+        request.request_id: build_allocation(
+            scheduler,
+            3,
+            initial_allocs[request.request_id][0][0],
+        )
+        for request in requests
+    }
     first_deltas = {}
     second_deltas = {}
     for request in requests:
-        first_deltas[request.request_id], second_deltas[request.request_id] = (
-            split_delta_first_group(
-                allocation_delta(
-                    initial_allocs[request.request_id],
-                    target_allocs[request.request_id],
-                )
-            )
+        first_deltas[request.request_id] = allocation_delta(
+            initial_allocs[request.request_id],
+            third_block_allocs[request.request_id],
+        )
+        second_deltas[request.request_id] = allocation_delta(
+            third_block_allocs[request.request_id],
+            target_allocs[request.request_id],
         )
 
     partial_metadata = scheduler.build_connector_meta(
@@ -424,10 +469,18 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
             finished_req_ids=set(),
         )
     )
+    expected_partial_dump_keys = {
+        request.request_id: [
+            generated_hashes(
+                scheduler.hash_block_size, request.all_token_ids, b"seed"
+            )[2]
+        ]
+        for request in requests
+    }
     for request in requests:
         request_meta = partial_metadata.request_meta[request.request_id]
-        assert request_meta.dump_keys == []
-        assert request_meta.dump_hash_end == request_meta.dump_hash_start
+        assert request_meta.dump_keys == expected_partial_dump_keys[request.request_id]
+        assert request_meta.dump_hash_end - request_meta.dump_hash_start == 1
 
     final_metadata = scheduler.build_connector_meta(
         FakeSchedulerOutput(
@@ -437,7 +490,7 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
                 set(),
                 [second_deltas[request.request_id] for request in requests],
             ),
-            num_scheduled_tokens={request.request_id: 1024 for request in requests},
+            num_scheduled_tokens={request.request_id: 512 for request in requests},
             finished_req_ids=set(),
         )
     )
@@ -446,17 +499,23 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
             block_hash
             for block_hash in generated_hashes(
                 scheduler.hash_block_size, request.all_token_ids, b"seed"
-            )[2:4]
+            )[3:4]
         ]
         for request in requests
     }
     for request in requests:
         request_meta = final_metadata.request_meta[request.request_id]
         assert request_meta.dump_keys == expected_dump_keys[request.request_id]
-        assert request_meta.dump_hash_end >= request_meta.dump_hash_start
+        assert request_meta.dump_hash_end - request_meta.dump_hash_start == len(
+            request_meta.dump_keys
+        )
         for group_id in scheduler.window_group_ids:
-            tail_blocks = scheduler.group_metas[group_id].tail_blocks
-            expected = 0 if tail_blocks == 0 else tail_blocks * len(request_meta.dump_keys)
+            expected = dump_candidate_count(
+                scheduler,
+                group_id,
+                request_meta.dump_hash_start,
+                request_meta.dump_hash_end,
+            )
             assert len(request_meta.dump_vllm_block_ids[group_id]) == expected
 
     rank0 = workers[0]
