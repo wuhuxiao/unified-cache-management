@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
 import numpy as np
+import pytest
 import torch
 
 from ucm.integration.vllm.hma_connector import (
@@ -72,7 +73,7 @@ def make_two_tail_connector() -> UCMFAWAConnector:
 def test_group_meta_uses_integer_ratios_and_zero_tail():
     connector = make_connector()
     connector.group_token_block_sizes = (256, 64, 64)
-    connector.group_tensor_block_sizes = (256, 64, 64)
+    connector.group_tensor_block_sizes = (256, 512, 64)
     connector.group_tail_blocks = (None, 1, 0)
     connector.group_window_spans = ((256,), (64,), ())
     connector.window_group_ids = (1, 2)
@@ -82,6 +83,7 @@ def test_group_meta_uses_integer_ratios_and_zero_tail():
     assert connector.group_metas[0].logical_blocks_per_hash_block == 1
     assert connector.group_metas[0].hash_blocks_per_tensor_block == 1
     assert connector.group_metas[1].logical_blocks_per_hash_block == 4
+    assert connector.group_metas[1].hash_blocks_per_tensor_block == 2
     assert connector.group_metas[1].tail_blocks == 1
     assert connector.group_metas[2].tail_blocks == 0
     assert connector.group_metas[2].window_spans == ()
@@ -853,6 +855,18 @@ def test_layout_extracts_segment_addresses_batch():
     assert addrs.shape == (2, 1)
     assert addrs[0, 0] == np.uint64(tensor[1, 32].data_ptr())
     assert addrs[1, 0] == np.uint64(tensor[2, 64].data_ptr())
+
+
+def test_layout_rejects_batch_address_mismatched_lengths():
+    tensor = torch.empty((4, 128, 3), dtype=torch.float32)
+    layout = KVCacheGroupLayout({"layer.0": tensor})
+
+    with pytest.raises(ValueError, match="same length"):
+        layout.extract_segment_addrs_batch(
+            np.asarray([1, 2], dtype=np.int64),
+            np.asarray([0], dtype=np.int64),
+            group_tensor_block_size=16384,
+        )
 
 
 def test_layout_handles_single_4d_ascend_tensor_shape():

@@ -308,13 +308,26 @@ class KVCacheGroupLayout:
         group_tensor_block_size: int,
     ) -> np.ndarray:
         signed_block_ids = np.asarray(block_ids, dtype=np.int64)
+        offsets_np = np.asarray(offsets, dtype=np.uint64)
+        if signed_block_ids.ndim != 1:
+            raise ValueError(
+                "KV cache block ids for batch address extraction must be 1-D."
+            )
+        if offsets_np.ndim != 1:
+            raise ValueError(
+                "KV cache logical offsets for batch address extraction must be 1-D."
+            )
+        if len(signed_block_ids) != len(offsets_np):
+            raise ValueError(
+                "KV cache block ids and logical offsets must have the same length."
+            )
         if signed_block_ids.size == 0:
             return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
         if np.any(signed_block_ids < 0):
             raise ValueError("Negative KV cache block id needs a scratch target.")
         block_ids_np = signed_block_ids.astype(np.uint64, copy=False)
         tensor_offsets = self._tensor_tokens_for_logical_batch(
-            np.asarray(offsets, dtype=np.uint64),
+            offsets_np,
             group_tensor_block_size,
         )
         return (
@@ -793,7 +806,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
-        self.group_metas: dict[int, KVCacheGroupMeta] = {}
         self.fa_group_ids, self.window_group_ids = self._partition_kv_cache_groups()
         if self._kv_cache_config is None:
             raise RuntimeError("FAWA connector requires kv_cache_config.")
