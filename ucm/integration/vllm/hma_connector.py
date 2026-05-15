@@ -1426,11 +1426,47 @@ class UCMFAWAConnector(UCMDirectConnector):
     ) -> None:
         pass
 
+    def _slice_group_block_ids(
+        self,
+        group_id: int,
+        group_block_ids: list[int],
+        hash_start: int,
+        hash_end: int,
+        *,
+        window_tail_only: bool,
+    ) -> list[int]:
+        if hash_end <= hash_start:
+            return []
+        meta = self.group_metas[group_id]
+        if window_tail_only:
+            if not meta.tail_blocks:
+                return []
+            selected: list[int] = []
+            for hash_idx in range(hash_start, hash_end):
+                logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
+                logical_start = max(
+                    hash_idx * meta.logical_blocks_per_hash_block,
+                    logical_end - meta.tail_blocks,
+                )
+                alloc_start = logical_start // meta.hash_blocks_per_tensor_block
+                alloc_end = (
+                    (logical_end - 1) // meta.hash_blocks_per_tensor_block
+                ) + 1
+                selected.extend(group_block_ids[alloc_start:alloc_end])
+            return selected
+
+        alloc_start = (
+            hash_start * meta.logical_blocks_per_hash_block
+        ) // meta.hash_blocks_per_tensor_block
+        logical_end = hash_end * meta.logical_blocks_per_hash_block
+        alloc_end = ((logical_end - 1) // meta.hash_blocks_per_tensor_block) + 1
+        return group_block_ids[alloc_start:alloc_end]
+
     def _generate_dispatch_meta(
         self,
         req_meta: FAWARequestMeta,
         new_tokens: int,
-        vllm_block_ids: tuple[list[int], ...],
+        new_vllm_block_ids: tuple[list[int], ...],
         need_load: bool = True,
     ) -> FAWARequestDispatchMeta:
         """
@@ -1445,34 +1481,56 @@ class UCMFAWAConnector(UCMDirectConnector):
         |                                         scheduled_block_num                                      |
         """
 
-        hbm_hit_block_num = req_meta.hbm_hit_block_num
-        total_hit_block_num = req_meta.total_hit_block_num
-        ucm_block_ids = req_meta.ucm_block_ids
-        for i, block_ids in enumerate(vllm_block_ids):
-            req_meta.vllm_block_ids[i].extend(block_ids)
+        if not req_meta.vllm_block_ids:
+            req_meta.vllm_block_ids = tuple([] for _ in self.group_metas)
+        if len(new_vllm_block_ids) != len(req_meta.vllm_block_ids):
+            raise RuntimeError(
+                f"FAWA dispatch metadata expected {len(req_meta.vllm_block_ids)} "
+                f"KV cache groups, got {len(new_vllm_block_ids)}."
+            )
+        for group_id, block_ids in enumerate(new_vllm_block_ids):
+            req_meta.vllm_block_ids[group_id].extend(block_ids)
 
-        load_block_keys, dump_block_keys = [], []
-        load_start,load_end,dump_start,dump_end = 0,0,0,0
-        load_vllm_block_ids, dump_vllm_block_ids= [], []
-        if need_load:
-            load_start = hbm_hit_block_num
-            load_end = total_hit_block_num
-            load_block_keys = ucm_block_ids[load_start:load_end]
-            for g_id, meta in self.group_metas.items():
-                g_start = int(load_start * meta.logical_blocks_per_hash_block)
-                g_end = int(load_end * meta.logical_blocks_per_hash_block)
-                load_vllm_block_ids.append(vllm_block_ids[g_id][g_start:g_end])
-            
+        all_group_block_ids = req_meta.vllm_block_ids
+        load_block_keys: list[bytes] = []
+        load_start, load_end = 0, 0
+        load_vllm_block_ids: list[list[int]] = []
+        if need_load and req_meta.total_hit_block_num > req_meta.hbm_hit_block_num:
+            load_start = req_meta.hbm_hit_block_num
+            load_end = req_meta.total_hit_block_num
+            load_block_keys = req_meta.ucm_block_ids[load_start:load_end]
+            for group_id, group_block_ids in enumerate(all_group_block_ids):
+                load_vllm_block_ids.append(
+                    self._slice_group_block_ids(
+                        group_id,
+                        group_block_ids,
+                        load_end - 1 if group_id in self.window_group_ids else load_start,
+                        load_end,
+                        window_tail_only=group_id in self.window_group_ids,
+                    )
+                )
 
-        if req_meta.token_processed < req_meta.num_token_ids:
-            dump_start = req_meta.token_processed // self.hash_block_size
-            dump_end = (req_meta.token_processed + new_tokens) // self.hash_block_size
-            dump_block_keys = ucm_block_ids[dump_start:dump_end]
-            for g_id, meta in self.group_metas.items():
-                g_start = int(dump_start * meta.logical_blocks_per_hash_block)
-                g_end = int(dump_end * meta.logical_blocks_per_hash_block)
-                dump_vllm_block_ids.append(vllm_block_ids[g_id][g_start:g_end])
-            req_meta.token_processed += new_tokens
+        computed_end_token = min(
+            req_meta.num_token_ids,
+            req_meta.token_processed + new_tokens,
+        )
+        dump_start = req_meta.token_processed // self.hash_block_size
+        dump_end = computed_end_token // self.hash_block_size
+        dump_block_keys: list[bytes] = []
+        dump_vllm_block_ids: list[list[int]] = []
+        if dump_end > dump_start:
+            dump_block_keys = req_meta.ucm_block_ids[dump_start:dump_end]
+            for group_id, group_block_ids in enumerate(all_group_block_ids):
+                dump_vllm_block_ids.append(
+                    self._slice_group_block_ids(
+                        group_id,
+                        group_block_ids,
+                        dump_start,
+                        dump_end,
+                        window_tail_only=group_id in self.window_group_ids,
+                    )
+                )
+        req_meta.token_processed = computed_end_token
 
         return FAWARequestDispatchMeta(
             load_keys=load_block_keys,
@@ -1497,7 +1555,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
-                    vllm_block_ids,
+                    tuple(vllm_block_ids),
                 )
 
 
@@ -1506,18 +1564,22 @@ class UCMFAWAConnector(UCMDirectConnector):
         for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
             req_meta = self.requests_meta.get(request_id)
             if req_meta:
-                new_block_ids = []
-                if scheduled_cached_reqs.new_block_ids[i] != None:
-                    new_block_ids = scheduled_cached_reqs.new_block_ids[i]
-                
+                new_block_ids = scheduled_cached_reqs.new_block_ids[i]
+                if new_block_ids is None:
+                    new_block_ids = tuple([] for _ in self.group_metas)
+                else:
+                    new_block_ids = tuple(new_block_ids)
                 resumed_from_preemption = (
-                    request_id in scheduled_cached_reqs.resumed_req_ids
+                    getattr(scheduled_cached_reqs, "resumed_from_preemption", False)
+                    or request_id in scheduled_cached_reqs.resumed_req_ids
                 )
+                if resumed_from_preemption:
+                    req_meta.vllm_block_ids = tuple([] for _ in self.group_metas)
                 requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                     req_meta,
                     scheduler_output.num_scheduled_tokens[request_id],
                     new_block_ids,
-                    resumed_from_preemption,
+                    need_load=False,
                 )
 
         for request_id in scheduler_output.finished_req_ids:

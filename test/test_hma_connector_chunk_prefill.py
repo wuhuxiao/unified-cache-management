@@ -56,10 +56,12 @@ def make_connector() -> UCMFAWAConnector:
     connector.window_group_ids = (1,)
     connector.group_token_block_sizes = (256, 64)
     connector.group_tensor_block_sizes = connector.group_token_block_sizes
+    connector.group_tensor_block_ratios = (1, 1)
     connector.group_tail_blocks = (None, 1)
     connector.group_window_spans = ((256,), (64,))
     connector.block_span_layout = None
     connector.requests_meta = {}
+    connector._init_group_metas()
     return connector
 
 
@@ -89,214 +91,127 @@ def test_group_meta_uses_integer_ratios_and_zero_tail():
     assert connector.group_metas[2].window_spans == ()
 
 
-def test_cached_chunk_prefill_appends_new_block_ids_for_later_dump():
+def test_dispatch_meta_accumulates_cached_blocks_and_slices_wa_tails():
     connector = make_connector()
-    request = FakeRequest("req-0")
     req_meta = FAWARequestMeta(
         ucm_block_ids=[b"a", b"b"],
-        hbm_hit_block_num=0,
-        total_hit_block_num=0,
         num_token_ids=512,
         token_processed=0,
     )
-    connector.requests_meta[request.request_id] = req_meta
-
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(10)],
-                [FakeBlock(100), FakeBlock(101), FakeBlock(102), FakeBlock(103)],
-            )
-        ),
-        0,
-    )
+    connector.requests_meta["req-0"] = req_meta
 
     first_step = FakeSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=FakeCachedRequestData(
-            req_ids=[request.request_id],
+            req_ids=["req-0"],
             resumed_req_ids=set(),
-            new_block_ids=[None],
+            new_block_ids=[([10], [100, 101, 102, 103])],
         ),
-        num_scheduled_tokens={request.request_id: 128},
+        num_scheduled_tokens={"req-0": 256},
         finished_req_ids=set(),
     )
     first_meta = connector.build_connector_meta(first_step)
-    assert isinstance(first_meta, UCMFAWAConnectorMetadata)
-    assert first_meta.request_meta[request.request_id].dump_block_ids == ([], [])
-    assert req_meta.token_processed == 128
-    assert req_meta.record_block_cursor == 1
+    first_req = first_meta.request_meta["req-0"]
+
+    assert first_req.dump_keys == [b"a"]
+    assert first_req.dump_hash_start == 0
+    assert first_req.dump_hash_end == 1
+    assert first_req.dump_vllm_block_ids == ([10], [103])
 
     second_step = FakeSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=FakeCachedRequestData(
-            req_ids=[request.request_id],
+            req_ids=["req-0"],
             resumed_req_ids=set(),
-            new_block_ids=[
-                (
-                    [11],
-                    [104, 105, 106, 107],
-                )
-            ],
+            new_block_ids=[([11], [104, 105, 106, 107])],
         ),
-        num_scheduled_tokens={request.request_id: 384},
+        num_scheduled_tokens={"req-0": 256},
         finished_req_ids=set(),
     )
     second_meta = connector.build_connector_meta(second_step)
+    second_req = second_meta.request_meta["req-0"]
 
-    assert isinstance(second_meta, UCMFAWAConnectorMetadata)
-    request_meta = second_meta.request_meta[request.request_id]
-    assert request_meta.dump_block_ids == (
-        [b"a", b"b"],
-        [
-            ([10], [103]),
-            ([11], [107]),
-        ],
-    )
-    assert req_meta.allocated_group_block_ids == (
+    assert second_req.dump_keys == [b"b"]
+    assert second_req.dump_hash_start == 1
+    assert second_req.dump_hash_end == 2
+    assert second_req.dump_vllm_block_ids == ([11], [107])
+    assert req_meta.vllm_block_ids == (
         [10, 11],
         [100, 101, 102, 103, 104, 105, 106, 107],
     )
-    assert req_meta.record_block_cursor == 2
     assert req_meta.token_processed == 512
 
 
-def test_window_rows_wait_for_complete_tail_blocks():
-    connector = make_two_tail_connector()
-    connector.hash_block_size = 64
-    connector.group_token_block_sizes = (64, 64)
-    connector.group_tensor_block_sizes = connector.group_token_block_sizes
-    connector.group_window_spans = ((64,), (64, 64))
+def test_load_metadata_slices_wa_to_final_boundary():
+    connector = make_connector()
     req_meta = FAWARequestMeta(
-        ucm_block_ids=[b"a"],
+        ucm_block_ids=[b"a", b"b", b"c"],
         hbm_hit_block_num=0,
-        total_hit_block_num=0,
-        num_token_ids=64,
-        token_processed=0,
+        total_hit_block_num=2,
+        num_token_ids=768,
+        token_processed=512,
+    )
+    connector.requests_meta["req-load"] = req_meta
+
+    request = type(
+        "ReqData",
+        (),
+        {
+            "req_id": "req-load",
+            "block_ids": (
+                [10, 11, 12],
+                [100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111],
+            ),
+        },
+    )()
+    metadata = connector.build_connector_meta(
+        FakeSchedulerOutput(
+            scheduled_new_reqs=[request],
+            scheduled_cached_reqs=FakeCachedRequestData([], set(), []),
+            num_scheduled_tokens={"req-load": 256},
+            finished_req_ids=set(),
+        )
     )
 
-    connector._replace_allocated_blocks(
-        req_meta,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(10)],
-                [FakeBlock(100)],
-            )
-        ),
-    )
-
-    assert req_meta.record_block_cursor == 0
-    assert connector._group_rows_for_indices(req_meta, []) == []
+    dispatch = metadata.request_meta["req-load"]
+    assert dispatch.load_keys == [b"a", b"b"]
+    assert dispatch.load_hash_start == 0
+    assert dispatch.load_hash_end == 2
+    assert dispatch.load_vllm_block_ids == ([10, 11], [107])
 
 
-def test_cached_chunk_prefill_replaces_block_ids_for_resumed_request():
+def test_zero_tail_window_group_uses_empty_candidate_list():
     connector = make_connector()
-    req_meta = FAWARequestMeta(
-        ucm_block_ids=[b"a"],
-        num_token_ids=256,
-        allocated_group_block_ids=([1], [10, 11, 12, 13]),
-    )
-    connector.requests_meta["req-1"] = req_meta
-
-    scheduler_output = FakeSchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=FakeCachedRequestData(
-            req_ids=["req-1"],
-            resumed_req_ids={"req-1"},
-            new_block_ids=[([2], [20, 21, 22, 23])],
-        ),
-        num_scheduled_tokens={"req-1": 256},
-        finished_req_ids=set(),
-    )
-    metadata = connector.build_connector_meta(scheduler_output)
-
-    assert metadata.request_meta["req-1"].dump_block_ids == (
-        [b"a"],
-        [([2], [23])],
-    )
-    assert req_meta.allocated_group_block_ids == ([2], [20, 21, 22, 23])
-
-
-def test_update_state_after_alloc_skips_canonical_block_until_all_groups_allocated():
-    connector = make_connector()
-    request = FakeRequest("req-2")
-    req_meta = FAWARequestMeta(
-        ucm_block_ids=[b"a"],
-        num_token_ids=256,
-    )
-    connector.requests_meta[request.request_id] = req_meta
-
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(10)],
-                [FakeBlock(100), FakeBlock(101), FakeBlock(102)],
-            )
-        ),
-        0,
-    )
-
-    assert req_meta.record_block_cursor == 0
-    assert req_meta.allocated_group_block_ids == (
-        [10],
-        [100, 101, 102],
-    )
-
-    scheduler_output = FakeSchedulerOutput(
-        scheduled_new_reqs=[],
-        scheduled_cached_reqs=FakeCachedRequestData(
-            req_ids=[request.request_id],
-            resumed_req_ids=set(),
-            new_block_ids=[
-                (
-                    [],
-                    [103],
-                )
-            ],
-        ),
-        num_scheduled_tokens={request.request_id: 256},
-        finished_req_ids=set(),
-    )
-    metadata = connector.build_connector_meta(scheduler_output)
-
-    assert metadata.request_meta[request.request_id].dump_block_ids == (
-        [b"a"],
-        [([10], [103])],
-    )
-    assert req_meta.record_block_cursor == 1
-    assert req_meta.token_processed == 256
-
-
-def test_tail_zero_group_has_empty_row_and_no_block_requirement():
-    connector = make_connector()
-    connector.group_token_block_sizes = (256, 64, 8)
+    connector.group_token_block_sizes = (256, 64, 64)
     connector.group_tensor_block_sizes = connector.group_token_block_sizes
+    connector.group_tensor_block_ratios = (1, 1, 1)
     connector.group_tail_blocks = (None, 1, 0)
     connector.group_window_spans = ((256,), (64,), ())
     connector.window_group_ids = (1, 2)
-    request = FakeRequest("req-tail-zero")
+    connector._init_group_metas()
+
     req_meta = FAWARequestMeta(
         ucm_block_ids=[b"a"],
         num_token_ids=256,
+        token_processed=0,
     )
-    connector.requests_meta[request.request_id] = req_meta
+    connector.requests_meta["req-zero"] = req_meta
 
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(10)],
-                [FakeBlock(100), FakeBlock(101), FakeBlock(102), FakeBlock(103)],
-                [],
-            )
-        ),
-        0,
+    metadata = connector.build_connector_meta(
+        FakeSchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=FakeCachedRequestData(
+                req_ids=["req-zero"],
+                resumed_req_ids=set(),
+                new_block_ids=[([10], [100, 101, 102, 103], [])],
+            ),
+            num_scheduled_tokens={"req-zero": 256},
+            finished_req_ids=set(),
+        )
     )
 
-    assert req_meta.record_block_cursor == 1
-    assert connector._group_rows_for_indices(req_meta, [0]) == [([10], [103], [])]
+    dispatch = metadata.request_meta["req-zero"]
+    assert dispatch.dump_vllm_block_ids == ([10], [103], [])
 
 
 class FakeStore:
