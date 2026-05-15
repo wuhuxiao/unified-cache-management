@@ -69,6 +69,24 @@ def make_two_tail_connector() -> UCMFAWAConnector:
     return connector
 
 
+def test_group_meta_uses_integer_ratios_and_zero_tail():
+    connector = make_connector()
+    connector.group_token_block_sizes = (256, 64, 64)
+    connector.group_tensor_block_sizes = (256, 64, 64)
+    connector.group_tail_blocks = (None, 1, 0)
+    connector.group_window_spans = ((256,), (64,), ())
+    connector.window_group_ids = (1, 2)
+
+    connector._init_group_metas()
+
+    assert connector.group_metas[0].logical_blocks_per_hash_block == 1
+    assert connector.group_metas[0].hash_blocks_per_tensor_block == 1
+    assert connector.group_metas[1].logical_blocks_per_hash_block == 4
+    assert connector.group_metas[1].tail_blocks == 1
+    assert connector.group_metas[2].tail_blocks == 0
+    assert connector.group_metas[2].window_spans == ()
+
+
 def test_cached_chunk_prefill_appends_new_block_ids_for_later_dump():
     connector = make_connector()
     request = FakeRequest("req-0")
@@ -820,6 +838,21 @@ def test_layout_extracts_segment_addresses_and_sizes():
     assert layout.segment_tensor_size_list(512, 16384) == [
         int(tensor[1, 32:36].numel() * tensor.element_size())
     ]
+
+
+def test_layout_extracts_segment_addresses_batch():
+    tensor = torch.empty((4, 128, 3), dtype=torch.float32)
+    layout = KVCacheGroupLayout({"layer.0": tensor})
+
+    addrs = layout.extract_segment_addrs_batch(
+        np.asarray([1, 2], dtype=np.int64),
+        np.asarray([4096, 8192], dtype=np.int64),
+        group_tensor_block_size=16384,
+    )
+
+    assert addrs.shape == (2, 1)
+    assert addrs[0, 0] == np.uint64(tensor[1, 32].data_ptr())
+    assert addrs[1, 0] == np.uint64(tensor[2, 64].data_ptr())
 
 
 def test_layout_handles_single_4d_ascend_tensor_shape():

@@ -48,6 +48,17 @@ class KVCacheSegment:
         )
 
 
+@dataclass(frozen=True)
+class KVCacheGroupMeta:
+    group_id: int
+    token_block_size: int
+    tensor_block_size: int
+    logical_blocks_per_hash_block: int
+    hash_blocks_per_tensor_block: int
+    tail_blocks: int | None
+    window_spans: tuple[int, ...]
+
+
 class KVCacheGroupLayout:
     """Flat pointer layout for one vLLM KV cache group.
 
@@ -222,6 +233,23 @@ class KVCacheGroupLayout:
         self._tensor_tokens_cache[key] = tensor_tokens
         return tensor_tokens
 
+    def _tensor_tokens_for_logical_batch(
+        self,
+        logical_offsets: np.ndarray,
+        group_tensor_block_size: int,
+    ) -> np.ndarray:
+        logical_offsets = np.asarray(logical_offsets, dtype=np.uint64)
+        scaled = logical_offsets[:, None] * self.view_tensor_block_sizes[None, :]
+        group_size = np.uint64(group_tensor_block_size)
+        misaligned = scaled % group_size
+        if np.any(misaligned):
+            raise ValueError(
+                f"Logical offsets {logical_offsets.tolist()} do not align with "
+                f"view tensor block sizes={self.view_tensor_block_sizes.tolist()} "
+                f"and group tensor block size={group_tensor_block_size}."
+            )
+        return scaled // group_size
+
     def extract_segment_addrs_flat(
         self,
         segment: KVCacheSegment,
@@ -270,6 +298,28 @@ class KVCacheGroupLayout:
         return (
             block_ids_np[:, None] * self.block_strides[None, :]
             + offsets_np * self.token_strides[None, :]
+            + self.base_ptrs[None, :]
+        ).astype(np.uint64, copy=False)
+
+    def extract_segment_addrs_batch(
+        self,
+        block_ids: np.ndarray,
+        offsets: np.ndarray,
+        group_tensor_block_size: int,
+    ) -> np.ndarray:
+        signed_block_ids = np.asarray(block_ids, dtype=np.int64)
+        if signed_block_ids.size == 0:
+            return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
+        if np.any(signed_block_ids < 0):
+            raise ValueError("Negative KV cache block id needs a scratch target.")
+        block_ids_np = signed_block_ids.astype(np.uint64, copy=False)
+        tensor_offsets = self._tensor_tokens_for_logical_batch(
+            np.asarray(offsets, dtype=np.uint64),
+            group_tensor_block_size,
+        )
+        return (
+            block_ids_np[:, None] * self.block_strides[None, :]
+            + tensor_offsets * self.token_strides[None, :]
             + self.base_ptrs[None, :]
         ).astype(np.uint64, copy=False)
 
@@ -356,12 +406,9 @@ class KVCacheGroupLayout:
         return int(self.view_tensor_block_sizes[0])
 
 
-# One canonical hash block mapped to segment spans for each vLLM KV cache group.
-KVCacheGroupRow = tuple[list[KVCacheSegment], ...]
+
 # Multiple canonical hash blocks, each represented as one KVCacheGroupRow.
-KVCacheGroupRows = list[KVCacheGroupRow]
-# Full HMA allocation snapshot by kv-cache group.
-KVCacheGroupAllocation = tuple[list[int], ...]
+KVCacheGroupRows = list[list]
 
 
 class FAWABlockSpanLayout:
@@ -679,31 +726,26 @@ class FAWABlockSpanLayout:
     def allocation_index(self, group_id: int, group_block_idx: int) -> int:
         return group_block_idx // self._group_tensor_block_ratio(group_id)
 
-
 @dataclass
 class FAWARequestMeta:
-    # Canonical per-hash-block remote keys used directly by FAWA stores.
     ucm_block_ids: list[bytes] = field(default_factory=list)
-    # Number of 256-token hash blocks already hit in vLLM's HBM prefix cache.
     hbm_hit_block_num: int = 0
-    # Total prefix hit in hash blocks, including HBM and external UCM hits.
     total_hit_block_num: int = 0
-    # Logical request token count; persistence is capped by this, not allocation.
     num_token_ids: int = 0
-    # Number of logical tokens already accounted for by scheduler progress.
+    vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
     token_processed: int = 0
-    # First canonical hash block that has not yet been emitted to store.
-    store_block_cursor: int = 0
-    # First canonical hash block whose per-group HMA row cannot be derived yet.
-    record_block_cursor: int = 0
-    # Full HMA allocation snapshot by kv-cache group, updated on alloc/chunk alloc.
-    allocated_group_block_ids: KVCacheGroupAllocation = field(default_factory=tuple)
 
 
 @dataclass
 class FAWARequestDispatchMeta:
-    load_block_ids: tuple[list[bytes], KVCacheGroupRows]
-    dump_block_ids: tuple[list[bytes], KVCacheGroupRows]
+    load_keys: list[bytes] = field(default_factory=list)
+    load_hash_start: int = 0
+    load_hash_end: int = 0
+    load_vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
+    dump_keys: list[bytes] = field(default_factory=list)
+    dump_hash_start: int = 0
+    dump_hash_end: int = 0
+    dump_vllm_block_ids: tuple[list[int], ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -744,13 +786,14 @@ class UCMFAWAConnector(UCMDirectConnector):
         self,
         vllm_config: "VllmConfig",
         role: KVConnectorRole,
-        kv_cache_config: Optional["KVCacheConfig"] = None,
+        kv_cache_config: "KVCacheConfig",
     ):
         self._defer_scheduler_store = True
         super().__init__(vllm_config, role, kv_cache_config)
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
+        self.group_metas: dict[int, KVCacheGroupMeta] = {}
         self.fa_group_ids, self.window_group_ids = self._partition_kv_cache_groups()
         if self._kv_cache_config is None:
             raise RuntimeError("FAWA connector requires kv_cache_config.")
@@ -763,6 +806,8 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
         self.group_tail_blocks = self._get_group_tail_blocks()
         self.group_window_spans = self._get_group_window_spans()
+        self.group_metas: dict[int, KVCacheGroupMeta] = {}
+        self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
         self.requests_meta: dict[str, FAWARequestMeta] = {}
@@ -874,6 +919,25 @@ class UCMFAWAConnector(UCMDirectConnector):
             self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
             ratios = self.group_tensor_block_ratios
         return ratios[group_id]
+
+    def _init_group_metas(self) -> None:
+        self.group_metas = {}
+        for group_id, token_block_size in enumerate(self.group_token_block_sizes):
+            tensor_block_size = self.group_tensor_block_sizes[group_id]
+            self.group_metas[group_id] = KVCacheGroupMeta(
+                group_id=group_id,
+                token_block_size=token_block_size,
+                tensor_block_size=tensor_block_size,
+                logical_blocks_per_hash_block=(
+                    self.hash_block_size // token_block_size
+                ),
+                hash_blocks_per_tensor_block=max(
+                    1,
+                    tensor_block_size // self.hash_block_size,
+                ),
+                tail_blocks=self.group_tail_blocks[group_id],
+                window_spans=self.group_window_spans[group_id],
+            )
 
     def _create_fa_store(
         self,
@@ -1008,8 +1072,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         return tuple(fa_group_ids), tuple(window_group_ids)
 
     def _partition_kv_cache_groups(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        if self._kv_cache_config is None:
-            raise RuntimeError("FAWA connector requires kv_cache_config.")
         fa_group_ids, window_group_ids = self._partition_group_specs(
             self._kv_cache_config.kv_cache_groups
         )
@@ -1266,216 +1328,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             raise RuntimeError(f"Worker FAWA {group_label} layout is empty.")
         return tensor_size_list
 
-    def _select_rows(
-        self,
-        group_rows: KVCacheGroupRows,
-        group_ids: tuple[int, ...],
-    ) -> KVCacheGroupRows:
-        return [
-            tuple(list(group_row[group_id]) for group_id in group_ids)
-            for group_row in group_rows
-        ]
-
-    def _group_block_range(self, group_id: int, computed_end_token: int) -> range:
-        # The block row is determined by the logical token boundary, not by
-        # how many tensor blocks vLLM has already allocated.
-        if self.group_tail_blocks[group_id] is None:
-            canonical_block_idx = computed_end_token // self.hash_block_size - 1
-            return range(canonical_block_idx, canonical_block_idx + 1)
-
-        total_group_blocks = (
-            computed_end_token // self.group_token_block_sizes[group_id]
-        )
-        tail_blocks = self.group_tail_blocks[group_id]
-        # Some compressor-state groups need no window tail for a prefix hit.
-        if not tail_blocks:
-            return range(total_group_blocks, total_group_blocks)
-        start = max(0, total_group_blocks - tail_blocks)
-        return range(start, total_group_blocks)
-
-    def _expected_group_row_segments(self, group_id: int) -> int:
-        tail_blocks = self.group_tail_blocks[group_id]
-        return 1 if tail_blocks is None else int(tail_blocks)
-
-    def _block_index_to_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        block_id: int,
-        computed_end_token: Optional[int] = None,
-    ) -> KVCacheSegment:
-        if self.block_span_layout is None:
-            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
-            return KVCacheSegment(
-                block_id=block_id,
-                offset=(group_block_idx % token_blocks_per_tensor_block)
-                * self.group_token_block_sizes[group_id],
-                length=self.group_token_block_sizes[group_id],
-            )
-        return self.block_span_layout.block_index_to_segment(
-            group_id,
-            group_block_idx,
-            block_id,
-        )
-
-    def _extract_group_addrs(
-        self,
-        group_rows: KVCacheGroupRows,
-        group_ids: tuple[int, ...],
-    ) -> np.ndarray:
-        rows: list[np.ndarray] = []
-        for group_row in group_rows:
-            row_parts: list[np.ndarray] = []
-            for row_group_id, selected_ids in enumerate(group_row):
-                group_id = group_ids[row_group_id]
-                layout = self.group_layouts.get(group_id)
-                if layout is None:
-                    continue
-                if not selected_ids:
-                    continue
-                for block_pos, segment in enumerate(selected_ids):
-                    if segment.block_id < 0:
-                        raise ValueError(
-                            f"KV cache group {group_id} block position "
-                            f"{block_pos} has invalid block id {segment.block_id}."
-                        )
-                    row_parts.append(
-                        layout.extract_segment_addrs_flat(
-                            segment,
-                            self.group_tensor_block_sizes[group_id],
-                        )
-                    )
-            if not row_parts:
-                raise ValueError("KV cache pointer row is empty.")
-            rows.append(np.concatenate(row_parts).astype(np.uint64, copy=False))
-        if not rows:
-            return np.empty((0, 0), dtype=np.uint64)
-        return np.vstack(rows)
-
-    def _try_select_group_block_ids(
-        self,
-        allocated_group_block_ids: KVCacheGroupAllocation,
-        computed_end_token: int,
-    ) -> Optional[KVCacheGroupRow]:
-        selected: list[list[KVCacheSegment]] = []
-        for group_id in range(len(self.group_token_block_sizes)):
-            group_indices = self._group_block_range(group_id, computed_end_token)
-            group_selected: list[KVCacheSegment] = []
-            if group_id >= len(allocated_group_block_ids):
-                if group_indices:
-                    return None
-                selected.append(group_selected)
-                continue
-
-            group_blocks = allocated_group_block_ids[group_id]
-            for group_block_idx in group_indices:
-                if self.block_span_layout is not None:
-                    tensor_block_idx = self.block_span_layout.allocation_index(
-                        group_id,
-                        group_block_idx,
-                    )
-                else:
-                    tensor_block_idx = (
-                        group_block_idx // self._group_tensor_block_ratio(group_id)
-                    )
-                if tensor_block_idx >= len(group_blocks):
-                    return None
-                block_id = group_blocks[tensor_block_idx]
-                if block_id < 0:
-                    return None
-                group_selected.append(
-                    self._block_index_to_segment(
-                        group_id,
-                        group_block_idx,
-                        block_id,
-                        computed_end_token,
-                    )
-                )
-            expected_segments = self._expected_group_row_segments(group_id)
-            if len(group_selected) < expected_segments:
-                return None
-            selected.append(group_selected)
-        return tuple(selected)
-
-    def _record_allocated_group_block_ids(
-        self,
-        req_meta: FAWARequestMeta,
-        group_block_ids: tuple[list[int], ...] | None,
-        replace: bool = False,
-    ) -> None:
-        if group_block_ids is None:
-            return
-        # cached.new_block_ids contains only blocks allocated in this scheduler
-        # step. Append it for chunk prefill; replace it for resumed requests.
-        new_group_block_ids = tuple(list(group) for group in group_block_ids)
-        if replace or not req_meta.allocated_group_block_ids:
-            req_meta.allocated_group_block_ids = new_group_block_ids
-            if replace:
-                req_meta.record_block_cursor = 0
-        else:
-            if len(req_meta.allocated_group_block_ids) != len(new_group_block_ids):
-                raise RuntimeError(
-                    "FAWA cached allocation update has mismatched group count: "
-                    f"current={len(req_meta.allocated_group_block_ids)}, "
-                    f"new={len(new_group_block_ids)}."
-                )
-            req_meta.allocated_group_block_ids = tuple(
-                current + new
-                for current, new in zip(
-                    req_meta.allocated_group_block_ids,
-                    new_group_block_ids,
-                )
-            )
-        self._record_ready_group_block_ids(req_meta)
-
-    def _replace_allocated_blocks(
-        self,
-        req_meta: FAWARequestMeta,
-        blocks: "KVCacheBlocks",
-    ) -> None:
-        req_meta.record_block_cursor = 0
-        req_meta.allocated_group_block_ids = tuple(
-            [-1 if block.is_null else block.block_id for block in group_blocks]
-            for group_blocks in blocks.blocks
-        )
-        self._record_ready_group_block_ids(req_meta)
-
-    def _summarize_request_meta(self, req_meta: FAWARequestMeta) -> dict[str, object]:
-        return {
-            "ucm_blocks": len(req_meta.ucm_block_ids),
-            "hbm_hit_blocks": req_meta.hbm_hit_block_num,
-            "total_hit_blocks": req_meta.total_hit_block_num,
-            "num_token_ids": req_meta.num_token_ids,
-            "token_processed": req_meta.token_processed,
-            "store_block_cursor": req_meta.store_block_cursor,
-            "record_block_cursor": req_meta.record_block_cursor,
-            "allocated_group_lens": [
-                len(group_blocks) for group_blocks in req_meta.allocated_group_block_ids
-            ],
-        }
-
-    def _record_ready_group_block_ids(
-        self,
-        req_meta: FAWARequestMeta,
-    ) -> None:
-        allocated_group_block_ids = req_meta.allocated_group_block_ids
-        if not allocated_group_block_ids:
-            return
-        max_full_blocks = req_meta.num_token_ids // self.hash_block_size
-        # Continue from the first unrecorded canonical block. Later chunk
-        # prefill steps may append enough group blocks to complete more rows.
-        # The cursor avoids rescanning already recorded rows on every scheduler tick.
-        for canonical_block_idx in range(
-            req_meta.record_block_cursor, max_full_blocks
-        ):
-            group_block_ids = self._try_select_group_block_ids(
-                allocated_group_block_ids,
-                (canonical_block_idx + 1) * self.hash_block_size,
-            )
-            if group_block_ids is None:
-                break
-            req_meta.record_block_cursor = canonical_block_idx + 1
-
     def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
         if self.fa_store is None:
             raise RuntimeError("FA store is not initialized.")
@@ -1537,10 +1389,7 @@ class UCMFAWAConnector(UCMDirectConnector):
             total_hit_block_num=total_hit_block_num,
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
-            store_block_cursor=total_hit_block_num,
-            record_block_cursor=0,
         )
-
         logger.info_once(
             f"FAWA request_id: {request.request_id}, "
             f"total_blocks_num: {len(canonical_hashes)}, "
@@ -1555,168 +1404,101 @@ class UCMFAWAConnector(UCMDirectConnector):
         blocks: "KVCacheBlocks",
         num_external_tokens: int,
     ) -> None:
-        req_meta = self.requests_meta.get(request.request_id)
-        if req_meta is None:
-            return
+        pass
 
-        try:
-            self._replace_allocated_blocks(req_meta, blocks)
-            logger.info(
-                f"request {request.request_id} FAWA req_meta after "
-                f"replace_allocated_blocks: "
-                f"{self._summarize_request_meta(req_meta)}"
-            )
-        except Exception as e:
-            logger.error(
-                f"request {request.request_id} record FAWA HBM-aligned "
-                f"block ids failed. {type(e).__name__}: {e}"
-            )
-            raise
-
-    def _make_dispatch_meta(
+    def _generate_dispatch_meta(
         self,
-        request_id: str,
         req_meta: FAWARequestMeta,
         new_tokens: int,
-        need_load: bool,
+        vllm_block_ids: tuple[list[int], ...],
+        need_load: bool = True,
     ) -> FAWARequestDispatchMeta:
-        load_keys: list[bytes] = []
-        load_group_block_ids: KVCacheGroupRows = []
-        if need_load and req_meta.total_hit_block_num > req_meta.hbm_hit_block_num:
-            # External-hit loads must have a complete contiguous plan; vLLM has
-            # already treated these tokens as computed.
-            load_end_block = self._get_contiguous_recorded_end_block(
-                req_meta,
-                req_meta.hbm_hit_block_num,
-                req_meta.total_hit_block_num,
-            )
-            if load_end_block < req_meta.total_hit_block_num:
-                raise RuntimeError(
-                    f"request {request_id} FAWA load plan is missing group block "
-                    f"ids for canonical blocks "
-                    f"[{load_end_block}, {req_meta.total_hit_block_num})."
-                )
-            load_keys, load_group_block_ids = self._block_keys_and_rows(
-                req_meta,
-                range(req_meta.hbm_hit_block_num, load_end_block),
-            )
+        """
+        Request Blocks layout:
+        ----------------------------------------------------------------------------------------------------
+        | local_computed_block(HBM hit) | external_computed_block(external hit) | new_block(need to dump)  |
+        ----------------------------------------------------------------------------------------------------
+        |      hbm_hit_block_num        |                 LOAD                  |     new_blocks_num       |
+        ----------------------------------------------------------------------------------------------------
+        |                              total_hit_block_num                      |
+        ----------------------------------------------------------------------------------------------------
+        |                                         scheduled_block_num                                      |
+        """
 
-        dump_keys: list[bytes] = []
-        dump_group_block_ids: KVCacheGroupRows = []
-        computed_end_token = min(
-            req_meta.num_token_ids,
-            req_meta.token_processed + new_tokens,
-        )
-        if req_meta.store_block_cursor < req_meta.num_token_ids // self.hash_block_size:
-            start_block = req_meta.store_block_cursor
-            candidate_end_block = computed_end_token // self.hash_block_size
-            # Store only full canonical blocks whose group rows are available.
-            end_block = self._get_contiguous_recorded_end_block(
-                req_meta,
-                start_block,
-                candidate_end_block,
-            )
-            if end_block > start_block:
-                dump_keys, dump_group_block_ids = self._block_keys_and_rows(
-                    req_meta,
-                    range(start_block, end_block),
-                )
-                req_meta.store_block_cursor = end_block
-            req_meta.token_processed = computed_end_token
+        hbm_hit_block_num = req_meta.hbm_hit_block_num
+        total_hit_block_num = req_meta.total_hit_block_num
+        ucm_block_ids = req_meta.ucm_block_ids
+        for i, block_ids in enumerate(vllm_block_ids):
+            req_meta.vllm_block_ids[i].extend(block_ids)
+
+        load_block_keys, dump_block_keys = [], []
+        load_start,load_end,dump_start,dump_end = 0,0,0,0
+        load_vllm_block_ids, dump_vllm_block_ids= [], []
+        if need_load:
+            load_start = hbm_hit_block_num
+            load_end = total_hit_block_num
+            load_block_keys = ucm_block_ids[load_start:load_end]
+            for g_id, meta in self.group_metas.items():
+                g_start = int(load_start * meta.logical_blocks_per_hash_block)
+                g_end = int(load_end * meta.logical_blocks_per_hash_block)
+                load_vllm_block_ids.append(vllm_block_ids[g_id][g_start:g_end])
+            
+
+        if req_meta.token_processed < req_meta.num_token_ids:
+            dump_start = req_meta.token_processed // self.hash_block_size
+            dump_end = (req_meta.token_processed + new_tokens) // self.hash_block_size
+            dump_block_keys = ucm_block_ids[dump_start:dump_end]
+            for g_id, meta in self.group_metas.items():
+                g_start = int(dump_start * meta.logical_blocks_per_hash_block)
+                g_end = int(dump_end * meta.logical_blocks_per_hash_block)
+                dump_vllm_block_ids.append(vllm_block_ids[g_id][g_start:g_end])
+            req_meta.token_processed += new_tokens
 
         return FAWARequestDispatchMeta(
-            (load_keys, load_group_block_ids),
-            (dump_keys, dump_group_block_ids),
+            load_keys=load_block_keys,
+            load_hash_start=load_start,
+            load_hash_end=load_end,
+            load_vllm_block_ids=tuple(load_vllm_block_ids),
+            dump_keys=dump_block_keys,
+            dump_hash_start=dump_start,
+            dump_hash_end=dump_end,
+            dump_vllm_block_ids=tuple(dump_vllm_block_ids),
         )
-
-    def _get_contiguous_recorded_end_block(
-        self,
-        req_meta: FAWARequestMeta,
-        start_block: int,
-        stop_block: int,
-    ) -> int:
-        return min(stop_block, req_meta.record_block_cursor)
-
-    def _block_keys_and_rows(
-        self,
-        req_meta: FAWARequestMeta,
-        block_indices: range,
-    ) -> tuple[list[bytes], KVCacheGroupRows]:
-        indices = list(block_indices)
-        return (
-            [req_meta.ucm_block_ids[idx] for idx in indices],
-            self._group_rows_for_indices(req_meta, indices),
-        )
-
-    def _group_rows_for_indices(
-        self,
-        req_meta: FAWARequestMeta,
-        block_indices: list[int],
-    ) -> KVCacheGroupRows:
-        if not block_indices:
-            return []
-
-        block_indices_np = np.asarray(block_indices, dtype=np.int64)
-        computed_end_tokens = (
-            (block_indices_np + 1) * np.int64(self.hash_block_size)
-        ).tolist()
-
-        rows: KVCacheGroupRows = []
-        for block_idx, computed_end_token in zip(block_indices, computed_end_tokens):
-            group_row = self._try_select_group_block_ids(
-                req_meta.allocated_group_block_ids,
-                computed_end_token,
-            )
-            if group_row is None:
-                raise RuntimeError(
-                    f"FAWA canonical block {block_idx} is not fully allocated."
-                )
-            rows.append(group_row)
-        return rows
-
-    @staticmethod
-    def _scheduled_cached_new_block_ids(
-        cached,
-        index: int,
-    ) -> tuple[list[int], ...] | None:
-        if index >= len(cached.new_block_ids):
-            return None
-        return cached.new_block_ids[index]
-
+    
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         requests_dispatch_meta: dict[str, FAWARequestDispatchMeta] = {}
-
+        # for new request, we need to load and dump
         for request in scheduler_output.scheduled_new_reqs:
-            req_meta = self.requests_meta.get(request.req_id)
+            request_id, vllm_block_ids = request.req_id, request.block_ids
+            req_meta = self.requests_meta.get(request_id)
             if req_meta:
-                requests_dispatch_meta[request.req_id] = self._make_dispatch_meta(
-                    request.req_id,
+                requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
                     req_meta,
-                    scheduler_output.num_scheduled_tokens[request.req_id],
-                    True,
+                    scheduler_output.num_scheduled_tokens[request_id],
+                    vllm_block_ids,
                 )
 
-        cached = scheduler_output.scheduled_cached_reqs
-        for i, request_id in enumerate(cached.req_ids):
+
+        
+        scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
+        for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
             req_meta = self.requests_meta.get(request_id)
-            if not req_meta:
-                continue
-            resumed = request_id in cached.resumed_req_ids
-            # Running chunk-prefill requests receive later allocations through
-            # scheduled_cached_reqs.new_block_ids, not update_state_after_alloc().
-            self._record_allocated_group_block_ids(
-                req_meta,
-                self._scheduled_cached_new_block_ids(cached, i),
-                replace=resumed,
-            )
-            requests_dispatch_meta[request_id] = self._make_dispatch_meta(
-                request_id,
-                req_meta,
-                scheduler_output.num_scheduled_tokens[request_id],
-                resumed,
-            )
+            if req_meta:
+                new_block_ids = []
+                if scheduled_cached_reqs.new_block_ids[i] != None:
+                    new_block_ids = scheduled_cached_reqs.new_block_ids[i]
+                
+                resumed_from_preemption = (
+                    request_id in scheduled_cached_reqs.resumed_req_ids
+                )
+                requests_dispatch_meta[request_id] = self._generate_dispatch_meta(
+                    req_meta,
+                    scheduler_output.num_scheduled_tokens[request_id],
+                    new_block_ids,
+                    resumed_from_preemption,
+                )
 
         for request_id in scheduler_output.finished_req_ids:
             self.requests_meta.pop(request_id, None)
@@ -1740,7 +1522,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         request: "Request",
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, object] | None]:
-        self.requests_meta.pop(request.request_id, None)
         return False, None
 
     def _submit_load_task(
@@ -1781,20 +1562,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             )
             self._invalid_block_ids.update(load_task.anchor_vllm_block_ids)
 
-    @staticmethod
-    def _row_anchor_vllm_block_ids(group_rows: KVCacheGroupRows) -> set[int]:
-        anchor_block_ids: set[int] = set()
-        for group_row in group_rows:
-            if not group_row:
-                continue
-            # vLLM currently handles load failures by matching block ids
-            # against the first KV-cache group. Report that anchor block id
-            # even when a non-anchor FAWA group load fails.
-            for segment in group_row[0]:
-                if segment.block_id >= 0:
-                    anchor_block_ids.add(segment.block_id)
-        return anchor_block_ids
-
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
         Get vLLM block IDs that failed to load through FAWA stores.
@@ -1831,6 +1598,21 @@ class UCMFAWAConnector(UCMDirectConnector):
             f"blocks={dump_task.key_count}"
         )
 
+    def _extract_fa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
+        """
+        this function need to extract the data ptr, but for Ascend need to consider more
+        hash_start, hash_end is the range of the contiguous part needs to be load or dump
+        the relation of hash_start, hash_end and candidate_vllm_ids can refer _generate_dispatch_meta func
+        for each hash_block_idx, we can get the vllm block id and offset for each group's tensor
+        """
+        pass
+
+    def _extract_wa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
+        """
+        samilar as _extract_fa_ptr, but for Ascend need to consider more
+        """
+        pass
+
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
@@ -1838,37 +1620,31 @@ class UCMFAWAConnector(UCMDirectConnector):
 
         tasks: list[FAWALoadTask] = []
         for request_id, request in metadata.request_meta.items():
-            keys, group_rows = request.load_block_ids
-            if not keys:
+            store_keys = request.load_keys
+            hash_start = request.load_hash_start
+            hash_end = request.load_hash_end
+            candidate_vllm_ids = request.load_vllm_block_ids
+            if not store_keys:
                 continue
             try:
-                if self.fa_store is None:
-                    raise RuntimeError("FA store is not initialized.")
                 # FA groups are loaded for every external-hit canonical block.
-                fa_ptrs = self._extract_group_addrs(
-                    self._select_rows(group_rows, self.fa_group_ids),
-                    self.fa_group_ids,
-                )
+                fa_ptrs = self._extract_fa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
                 tasks.append(
                     self._submit_load_task(
                         request_id,
                         "FA",
                         self.fa_store,
-                        keys,
+                        store_keys,
                         fa_ptrs,
-                        self._row_anchor_vllm_block_ids(group_rows),
+                        candidate_vllm_ids,
                     )
                 )
 
                 if self.wa_store is None:
                     raise RuntimeError("WA store is not initialized.")
                 # WA groups only need the final matched boundary.
-                window_keys = keys[-1:]
-                window_rows = self._select_rows(group_rows[-1:], self.window_group_ids)
-                window_ptrs = self._extract_group_addrs(
-                    window_rows,
-                    self.window_group_ids,
-                )
+                window_keys = store_keys[-1:]
+                window_ptrs = self._extract_wa_ptr(store_keys, hash_end-1, hash_end, candidate_vllm_ids)
                 tasks.append(
                     self._submit_load_task(
                         request_id,
@@ -1876,7 +1652,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                         self.wa_store,
                         window_keys,
                         window_ptrs,
-                        self._row_anchor_vllm_block_ids(group_rows[-1:]),
+                        candidate_vllm_ids,
                     )
                 )
             except Exception as e:
@@ -1884,9 +1660,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                     f"request {request_id} submit FAWA load task "
                     f"error. {type(e).__name__}: {e}"
                 )
-                self._invalid_block_ids.update(
-                    self._row_anchor_vllm_block_ids(group_rows)
-                )
+                self._invalid_block_ids.update(candidate_vllm_ids)
 
         for load_task in tasks:
             self._wait_load_task(load_task)
@@ -1906,62 +1680,29 @@ class UCMFAWAConnector(UCMDirectConnector):
             if self.wa_store is None:
                 raise RuntimeError("WA store is not initialized.")
 
-            if not getattr(self, "_ascend_layout", False):
-                for request in metadata.request_meta.values():
-                    req_keys, req_group_rows = request.dump_block_ids
-                    if not req_keys:
-                        continue
-
-                    tasks: list[FAWADumpTask] = []
-                    fa_ptrs = self._extract_group_addrs(
-                        self._select_rows(req_group_rows, self.fa_group_ids),
-                        self.fa_group_ids,
-                    )
-                    tasks.append(
-                        self._submit_dump_task(
-                            "FA",
-                            self.fa_store,
-                            req_keys,
-                            fa_ptrs,
-                            event_handle,
-                        )
-                    )
-                    window_ptrs = self._extract_group_addrs(
-                        self._select_rows(req_group_rows, self.window_group_ids),
-                        self.window_group_ids,
-                    )
-                    tasks.append(
-                        self._submit_dump_task(
-                            "WA",
-                            self.wa_store,
-                            req_keys,
-                            window_ptrs,
-                            event_handle,
-                        )
-                    )
-                    for dump_task in tasks:
-                        self._wait_dump_task(dump_task)
-                return
 
             total_keys: list[bytes] = []
             total_group_rows: KVCacheGroupRows = []
+            fa_ptrs = []
+            window_ptrs = []
             for request in metadata.request_meta.values():
-                req_keys, req_group_rows = request.dump_block_ids
-                if not req_keys:
+                store_keys = request.dump_keys
+                hash_start = request.dump_hash_start
+                hash_end = request.dump_hash_end
+                candidate_vllm_ids = request.dump_vllm_block_ids
+                if not store_keys:
                     continue
-                total_keys.extend(req_keys)
-                total_group_rows.extend(req_group_rows)
+                total_keys.extend(store_keys)
+                req_fa_ptrs = self._extract_fa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
+                req_window_ptrs = self._extract_wa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
+                fa_ptrs.extend(req_fa_ptrs)
+                window_ptrs.extend(req_window_ptrs)
 
             if not total_keys:
                 return
 
             tasks: list[FAWADumpTask] = []
-            # Batch all request rows in one worker call; this keeps metadata
-            # dispatch order while avoiding one FA/WA task pair per request.
-            fa_ptrs = self._extract_group_addrs(
-                self._select_rows(total_group_rows, self.fa_group_ids),
-                self.fa_group_ids,
-            )
+
             tasks.append(
                 self._submit_dump_task(
                     "FA",
@@ -1970,10 +1711,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                     fa_ptrs,
                     event_handle,
                 )
-            )
-            window_ptrs = self._extract_group_addrs(
-                self._select_rows(total_group_rows, self.window_group_ids),
-                self.window_group_ids,
             )
             tasks.append(
                 self._submit_dump_task(
