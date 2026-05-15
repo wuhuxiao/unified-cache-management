@@ -1696,6 +1696,11 @@ class UCMFAWAConnector(UCMDirectConnector):
         """
         if not store_keys:
             return np.empty((0, 0), dtype=np.uint64)
+        if len(store_keys) != hash_end - hash_start:
+            raise ValueError(
+                f"FA KV cache store key count {len(store_keys)} does not match "
+                f"hash range [{hash_start}, {hash_end})."
+            )
 
         rows: list[list[np.ndarray]] = [[] for _ in store_keys]
         for group_id in self.fa_group_ids:
@@ -1751,6 +1756,11 @@ class UCMFAWAConnector(UCMDirectConnector):
         """
         if not store_keys:
             return np.empty((0, 0), dtype=np.uint64)
+        if len(store_keys) != hash_end - hash_start:
+            raise ValueError(
+                f"WA KV cache store key count {len(store_keys)} does not match "
+                f"hash range [{hash_start}, {hash_end})."
+            )
 
         rows: list[list[np.ndarray]] = [[] for _ in store_keys]
         for group_id in self.window_group_ids:
@@ -1850,7 +1860,12 @@ class UCMFAWAConnector(UCMDirectConnector):
                     raise RuntimeError("WA store is not initialized.")
                 # WA groups only need the final matched boundary.
                 window_keys = store_keys[-1:]
-                window_ptrs = self._extract_wa_ptr(store_keys, hash_end-1, hash_end, candidate_vllm_ids)
+                window_ptrs = self._extract_wa_ptr(
+                    window_keys,
+                    hash_end - 1,
+                    hash_end,
+                    candidate_vllm_ids,
+                )
                 tasks.append(
                     self._submit_load_task(
                         request_id,

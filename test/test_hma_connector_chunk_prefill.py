@@ -384,6 +384,23 @@ def test_extract_wa_ptr_offsets_trimmed_window_span_to_tail_start():
     assert ptrs[0, 0] == np.uint64(tensor[5, 28].data_ptr())
 
 
+def test_extract_wa_ptr_rejects_mismatched_key_range_length():
+    connector = make_connector()
+    connector.group_layouts = {
+        1: KVCacheGroupLayout(
+            {"layer.0.wa": torch.empty((16, 64, 1), dtype=torch.float32)}
+        )
+    }
+
+    with pytest.raises(ValueError, match="store key count"):
+        connector._extract_wa_ptr(
+            [b"a", b"b"],
+            1,
+            2,
+            ([], [7]),
+        )
+
+
 class FakeStore:
     def __init__(self, hit_index: int, lookup_hits: list[bool] | None = None):
         self.hit_index = hit_index
