@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM UCM Skill Maintainer"
+  short_description: "Keep project development skills current."
+  default_prompt: "Use $vllm-ucm-skill-maintainer to update project skills from recent code and test changes."

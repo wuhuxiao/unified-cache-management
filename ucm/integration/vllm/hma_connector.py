@@ -65,6 +65,8 @@ class KVCacheGroupLayout:
         self.tensor_size_per_token_lists: np.ndarray
         self.view_tensor_block_sizes: np.ndarray
         self._build_layout()
+        self._tensor_tokens_cache: dict[tuple[int, int], np.ndarray] = {}
+        self._segment_tensor_size_cache: dict[tuple[int, int], tuple[int, ...]] = {}
 
     @staticmethod
     def _sort_key(item: tuple[str, torch.Tensor]) -> tuple[int, str]:
@@ -198,49 +200,99 @@ class KVCacheGroupLayout:
             )
         return scaled // group_tensor_block_size
 
+    def _tensor_tokens_for_logical(
+        self,
+        logical_tokens: int,
+        group_tensor_block_size: int,
+    ) -> np.ndarray:
+        key = (group_tensor_block_size, logical_tokens)
+        cached = self._tensor_tokens_cache.get(key)
+        if cached is not None:
+            return cached
+
+        scaled = self.view_tensor_block_sizes * np.uint64(logical_tokens)
+        misaligned = scaled % np.uint64(group_tensor_block_size)
+        if np.any(misaligned):
+            raise ValueError(
+                f"Logical segment of {logical_tokens} tokens does not align with "
+                f"view tensor block sizes={self.view_tensor_block_sizes.tolist()} "
+                f"and group tensor block size={group_tensor_block_size}."
+            )
+        tensor_tokens = scaled // np.uint64(group_tensor_block_size)
+        self._tensor_tokens_cache[key] = tensor_tokens
+        return tensor_tokens
+
+    def extract_segment_addrs_flat(
+        self,
+        segment: KVCacheSegment,
+        group_tensor_block_size: int,
+    ) -> np.ndarray:
+        if segment.block_id < 0:
+            raise ValueError("Negative KV cache block id needs a scratch target.")
+        # The offset conversion is reused heavily by load/dump metadata dispatch.
+        tensor_offsets = self._tensor_tokens_for_logical(
+            segment.offset,
+            group_tensor_block_size,
+        )
+        return (
+            np.uint64(segment.block_id) * self.block_strides
+            + tensor_offsets * self.token_strides
+            + self.base_ptrs
+        ).astype(np.uint64, copy=False)
+
     def extract_segment_addrs(
         self,
         segments: list[KVCacheSegment],
         group_tensor_block_size: int,
     ) -> np.ndarray:
-        block_ids_np = np.array([segment.block_id for segment in segments], np.uint64)
-        offsets_np = np.array(
+        if not segments:
+            return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
+        if len(segments) == 1:
+            return self.extract_segment_addrs_flat(
+                segments[0],
+                group_tensor_block_size,
+            ).reshape(1, -1)
+
+        block_ids_np = np.fromiter(
+            (segment.block_id for segment in segments),
+            dtype=np.uint64,
+            count=len(segments),
+        )
+        offsets_np = np.vstack(
             [
-                [
-                    self._logical_to_tensor_tokens(
-                        segment.offset,
-                        group_tensor_block_size,
-                        int(view_tensor_block_size),
-                    )
-                    for view_tensor_block_size in self.view_tensor_block_sizes
-                ]
+                self._tensor_tokens_for_logical(
+                    segment.offset,
+                    group_tensor_block_size,
+                )
                 for segment in segments
-            ],
-            np.uint64,
+            ]
         )
         return (
             block_ids_np[:, None] * self.block_strides[None, :]
             + offsets_np * self.token_strides[None, :]
             + self.base_ptrs[None, :]
-        )
+        ).astype(np.uint64, copy=False)
 
     def segment_tensor_size_list(
         self,
         logical_tokens: int,
         group_tensor_block_size: int,
     ) -> list[int]:
-        tensor_tokens = np.array(
-            [
-                self._logical_to_tensor_tokens(
-                    logical_tokens,
-                    group_tensor_block_size,
-                    int(view_tensor_block_size),
-                )
-                for view_tensor_block_size in self.view_tensor_block_sizes
-            ],
-            np.uint64,
-        )
-        return (self.tensor_size_per_token_lists * tensor_tokens).tolist()
+        key = (group_tensor_block_size, logical_tokens)
+        cached = self._segment_tensor_size_cache.get(key)
+        if cached is None:
+            tensor_tokens = self._tensor_tokens_for_logical(
+                logical_tokens,
+                group_tensor_block_size,
+            )
+            cached = tuple(
+                int(size)
+                for size in (
+                    self.tensor_size_per_token_lists * tensor_tokens
+                ).tolist()
+            )
+            self._segment_tensor_size_cache[key] = cached
+        return list(cached)
 
     def extract_block_tensor_views(
         self, vllm_block_ids: list[int]
@@ -260,21 +312,25 @@ class KVCacheGroupLayout:
         tensors: list[torch.Tensor] = []
 
         for segment in segments:
-            for tensor, view_tensor_block_size in zip(
-                self.view_tensors, self.view_tensor_block_sizes
+            tensor_offsets = self._tensor_tokens_for_logical(
+                segment.offset,
+                group_tensor_block_size,
+            )
+            tensor_lengths = self._tensor_tokens_for_logical(
+                segment.length,
+                group_tensor_block_size,
+            )
+            for tensor, tensor_offset, tensor_length in zip(
+                self.view_tensors,
+                tensor_offsets,
+                tensor_lengths,
             ):
-                tensor_offset = self._logical_to_tensor_tokens(
-                    segment.offset,
-                    group_tensor_block_size,
-                    int(view_tensor_block_size),
-                )
-                tensor_length = self._logical_to_tensor_tokens(
-                    segment.length,
-                    group_tensor_block_size,
-                    int(view_tensor_block_size),
-                )
                 tensors.append(
-                    tensor[segment.block_id].narrow(0, tensor_offset, tensor_length)
+                    tensor[segment.block_id].narrow(
+                        0,
+                        int(tensor_offset),
+                        int(tensor_length),
+                    )
                 )
         return tensors
 
@@ -346,6 +402,7 @@ class FAWABlockSpanLayout:
         self.hash_block_size = self._get_hash_block_size()
         self.group_token_block_sizes = self._get_group_token_block_sizes()
         self.group_tensor_block_sizes = self._get_group_tensor_block_sizes()
+        self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
         self.group_layer_tensor_indices = self._get_group_layer_tensor_indices()
 
     @staticmethod
@@ -536,6 +593,28 @@ class FAWABlockSpanLayout:
             )
         return tuple(tensor_block_sizes)
 
+    def _get_group_tensor_block_ratios(self) -> tuple[int, ...]:
+        ratios: list[int] = []
+        for group_id, (
+            group_token_block_size,
+            group_tensor_block_size,
+        ) in enumerate(zip(self.group_token_block_sizes, self.group_tensor_block_sizes)):
+            if group_tensor_block_size % group_token_block_size != 0:
+                raise RuntimeError(
+                    f"FAWA group {group_id} logical block size "
+                    f"{group_token_block_size} must divide tensor block size "
+                    f"{group_tensor_block_size}."
+                )
+            ratios.append(group_tensor_block_size // group_token_block_size)
+        return tuple(ratios)
+
+    def _group_tensor_block_ratio(self, group_id: int) -> int:
+        ratios = getattr(self, "group_tensor_block_ratios", None)
+        if ratios is None:
+            self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
+            ratios = self.group_tensor_block_ratios
+        return ratios[group_id]
+
     @classmethod
     def spec_tensor_count(cls, spec: object) -> int:
         return cls.ASCEND_MULTI_TENSOR_SPECS.get(type(spec).__name__, 1)
@@ -582,15 +661,7 @@ class FAWABlockSpanLayout:
         block_id: int,
     ) -> KVCacheSegment:
         group_token_block_size = self.group_token_block_sizes[group_id]
-        group_tensor_block_size = self.group_tensor_block_sizes[group_id]
-        if group_tensor_block_size % group_token_block_size != 0:
-            raise RuntimeError(
-                f"FAWA group {group_id} logical block size {group_token_block_size} "
-                f"must divide tensor block size {group_tensor_block_size}."
-            )
-        token_blocks_per_tensor_block = (
-            group_tensor_block_size // group_token_block_size
-        )
+        token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
         tensor_block_idx = group_block_idx // token_blocks_per_tensor_block
         if tensor_block_idx != block_id:
             logger.debug(
@@ -606,16 +677,12 @@ class FAWABlockSpanLayout:
         )
 
     def allocation_index(self, group_id: int, group_block_idx: int) -> int:
-        return (
-            group_block_idx
-            * self.group_token_block_sizes[group_id]
-            // self.group_tensor_block_sizes[group_id]
-        )
+        return group_block_idx // self._group_tensor_block_ratio(group_id)
 
 
 @dataclass
 class FAWARequestMeta:
-    # Canonical per-hash-block remote keys before _block_key() namespacing.
+    # Canonical per-hash-block remote keys used directly by FAWA stores.
     ucm_block_ids: list[bytes] = field(default_factory=list)
     # Number of 256-token hash blocks already hit in vLLM's HBM prefix cache.
     hbm_hit_block_num: int = 0
@@ -627,8 +694,8 @@ class FAWARequestMeta:
     token_processed: int = 0
     # First canonical hash block that has not yet been emitted to store.
     store_block_cursor: int = 0
-    # canonical block idx -> per-kv-cache-group block ids needed to load/store it.
-    group_block_ids: dict[int, KVCacheGroupRow] = field(default_factory=dict)
+    # First canonical hash block whose per-group HMA row cannot be derived yet.
+    record_block_cursor: int = 0
     # Full HMA allocation snapshot by kv-cache group, updated on alloc/chunk alloc.
     allocated_group_block_ids: KVCacheGroupAllocation = field(default_factory=tuple)
 
@@ -684,7 +751,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
-        self._window_scratch_views: dict[tuple[int, int], list[torch.Tensor]] = {}
         self.fa_group_ids, self.window_group_ids = self._partition_kv_cache_groups()
         if self._kv_cache_config is None:
             raise RuntimeError("FAWA connector requires kv_cache_config.")
@@ -694,6 +760,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.block_size = self.hash_block_size
         self.group_token_block_sizes = self._get_group_token_block_sizes()
         self.group_tensor_block_sizes = self._get_group_tensor_block_sizes()
+        self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
         self.group_tail_blocks = self._get_group_tail_blocks()
         self.group_window_spans = self._get_group_window_spans()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
@@ -785,6 +852,28 @@ class UCMFAWAConnector(UCMDirectConnector):
                     f"FAWA group {group_id} block size {group_token_block_size} "
                     f"must divide {self.hash_block_size}."
                 )
+
+    def _get_group_tensor_block_ratios(self) -> tuple[int, ...]:
+        ratios: list[int] = []
+        for group_id, (
+            group_token_block_size,
+            group_tensor_block_size,
+        ) in enumerate(zip(self.group_token_block_sizes, self.group_tensor_block_sizes)):
+            if group_tensor_block_size % group_token_block_size != 0:
+                raise RuntimeError(
+                    f"FAWA group {group_id} logical block size "
+                    f"{group_token_block_size} must divide tensor block size "
+                    f"{group_tensor_block_size}."
+                )
+            ratios.append(group_tensor_block_size // group_token_block_size)
+        return tuple(ratios)
+
+    def _group_tensor_block_ratio(self, group_id: int) -> int:
+        ratios = getattr(self, "group_tensor_block_ratios", None)
+        if ratios is None:
+            self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
+            ratios = self.group_tensor_block_ratios
+        return ratios[group_id]
 
     def _create_fa_store(
         self,
@@ -1149,9 +1238,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             except Exception as e:
                 logger.warning(f"Failed to bind worker: {e}")
 
-    def _block_key(self, canonical_hash: bytes) -> bytes:
-        return self.request_hasher((b"fawa", canonical_hash))
-
     def _store_tensor_size_list(
         self,
         group_layouts: dict[int, KVCacheGroupLayout],
@@ -1219,10 +1305,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         computed_end_token: Optional[int] = None,
     ) -> KVCacheSegment:
         if self.block_span_layout is None:
-            token_blocks_per_tensor_block = (
-                self.group_tensor_block_sizes[group_id]
-                // self.group_token_block_sizes[group_id]
-            )
+            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
             return KVCacheSegment(
                 block_id=block_id,
                 offset=(group_block_idx % token_blocks_per_tensor_block)
@@ -1235,63 +1318,10 @@ class UCMFAWAConnector(UCMDirectConnector):
             block_id,
         )
 
-    def _make_missing_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        computed_end_token: Optional[int] = None,
-    ) -> KVCacheSegment:
-        return KVCacheSegment(
-            block_id=-1,
-            offset=0,
-            length=self.group_token_block_sizes[group_id],
-        )
-
-    def _scratch_block_tensor_views(
-        self,
-        group_id: int,
-        block_pos: int,
-    ) -> list[torch.Tensor]:
-        key = (group_id, block_pos)
-        scratch_views = self._window_scratch_views.get(key)
-        if scratch_views is None:
-            layout = self.group_layouts[group_id]
-            scratch_views = [
-                torch.empty_like(tensor)
-                for tensor in layout.extract_segment_tensor_views(
-                    [
-                        KVCacheSegment(
-                            block_id=0,
-                            offset=0,
-                            length=self._window_segment_length(group_id, block_pos),
-                        )
-                    ],
-                    self.group_tensor_block_sizes[group_id],
-                )
-            ]
-            self._window_scratch_views[key] = scratch_views
-        return scratch_views
-
-    def _scratch_block_addrs(self, group_id: int, block_pos: int) -> np.ndarray:
-        return np.asarray(
-            [
-                tensor.data_ptr()
-                for tensor in self._scratch_block_tensor_views(group_id, block_pos)
-            ],
-            dtype=np.uint64,
-        )
-
-    def _window_segment_length(self, group_id: int, block_pos: int) -> int:
-        spans = self.group_window_spans[group_id]
-        if not spans:
-            return self.group_token_block_sizes[group_id]
-        return spans[min(block_pos, len(spans) - 1)]
-
     def _extract_group_addrs(
         self,
         group_rows: KVCacheGroupRows,
         group_ids: tuple[int, ...],
-        scratch_for_missing: bool = False,
     ) -> np.ndarray:
         rows: list[np.ndarray] = []
         for group_row in group_rows:
@@ -1305,19 +1335,16 @@ class UCMFAWAConnector(UCMDirectConnector):
                     continue
                 for block_pos, segment in enumerate(selected_ids):
                     if segment.block_id < 0:
-                        if not scratch_for_missing:
-                            raise ValueError(
-                                f"KV cache group {group_id} block "
-                                f"position {block_pos} needs a scratch target."
-                            )
-                        row_parts.append(self._scratch_block_addrs(group_id, block_pos))
-                    else:
-                        row_parts.append(
-                            layout.extract_segment_addrs(
-                                [segment],
-                                self.group_tensor_block_sizes[group_id],
-                            ).reshape(-1)
+                        raise ValueError(
+                            f"KV cache group {group_id} block position "
+                            f"{block_pos} has invalid block id {segment.block_id}."
                         )
+                    row_parts.append(
+                        layout.extract_segment_addrs_flat(
+                            segment,
+                            self.group_tensor_block_sizes[group_id],
+                        )
+                    )
             if not row_parts:
                 raise ValueError("KV cache pointer row is empty.")
             rows.append(np.concatenate(row_parts).astype(np.uint64, copy=False))
@@ -1329,7 +1356,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self,
         allocated_group_block_ids: KVCacheGroupAllocation,
         computed_end_token: int,
-        allow_null_tail: bool = False,
     ) -> Optional[KVCacheGroupRow]:
         selected: list[list[KVCacheSegment]] = []
         for group_id in range(len(self.group_token_block_sizes)):
@@ -1350,30 +1376,13 @@ class UCMFAWAConnector(UCMDirectConnector):
                     )
                 else:
                     tensor_block_idx = (
-                        group_block_idx
-                        * self.group_token_block_sizes[group_id]
-                        // self.group_tensor_block_sizes[group_id]
+                        group_block_idx // self._group_tensor_block_ratio(group_id)
                     )
                 if tensor_block_idx >= len(group_blocks):
                     return None
                 block_id = group_blocks[tensor_block_idx]
                 if block_id < 0:
-                    # A skipped WA tail before the final external-hit boundary is
-                    # loaded into scratch, because only the final WA row is used.
-                    if allow_null_tail and group_id in self.window_group_ids:
-                        group_selected.append(
-                            self._make_missing_segment(
-                                group_id,
-                                group_block_idx,
-                                computed_end_token,
-                            )
-                        )
-                        continue
-                    raise ValueError(
-                        f"KV cache group {group_id} block index "
-                        f"{group_block_idx} maps to a null HBM block for "
-                        f"computed end token {computed_end_token}."
-                    )
+                    return None
                 group_selected.append(
                     self._block_index_to_segment(
                         group_id,
@@ -1384,17 +1393,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                 )
             expected_segments = self._expected_group_row_segments(group_id)
             if len(group_selected) < expected_segments:
-                padding_start_idx = group_indices.start - (
-                    expected_segments - len(group_selected)
-                )
-                group_selected = [
-                    self._make_missing_segment(
-                        group_id,
-                        padding_start_idx + pad_idx,
-                        computed_end_token,
-                    )
-                    for pad_idx in range(expected_segments - len(group_selected))
-                ] + group_selected
+                return None
             selected.append(group_selected)
         return tuple(selected)
 
@@ -1411,6 +1410,8 @@ class UCMFAWAConnector(UCMDirectConnector):
         new_group_block_ids = tuple(list(group) for group in group_block_ids)
         if replace or not req_meta.allocated_group_block_ids:
             req_meta.allocated_group_block_ids = new_group_block_ids
+            if replace:
+                req_meta.record_block_cursor = 0
         else:
             if len(req_meta.allocated_group_block_ids) != len(new_group_block_ids):
                 raise RuntimeError(
@@ -1432,6 +1433,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         req_meta: FAWARequestMeta,
         blocks: "KVCacheBlocks",
     ) -> None:
+        req_meta.record_block_cursor = 0
         req_meta.allocated_group_block_ids = tuple(
             [-1 if block.is_null else block.block_id for block in group_blocks]
             for group_blocks in blocks.blocks
@@ -1439,23 +1441,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self._record_ready_group_block_ids(req_meta)
 
     def _summarize_request_meta(self, req_meta: FAWARequestMeta) -> dict[str, object]:
-        recorded_blocks = sorted(req_meta.group_block_ids)
-        recorded_range = (
-            (recorded_blocks[0], recorded_blocks[-1] + 1) if recorded_blocks else (0, 0)
-        )
-        sample_rows = {
-            block_idx: [
-                len(group_segments)
-                for group_segments in req_meta.group_block_ids[block_idx]
-            ]
-            for block_idx in recorded_blocks[:3]
-        }
-        if len(recorded_blocks) > 3:
-            last_block_idx = recorded_blocks[-1]
-            sample_rows[last_block_idx] = [
-                len(group_segments)
-                for group_segments in req_meta.group_block_ids[last_block_idx]
-            ]
         return {
             "ucm_blocks": len(req_meta.ucm_block_ids),
             "hbm_hit_blocks": req_meta.hbm_hit_block_num,
@@ -1463,12 +1448,10 @@ class UCMFAWAConnector(UCMDirectConnector):
             "num_token_ids": req_meta.num_token_ids,
             "token_processed": req_meta.token_processed,
             "store_block_cursor": req_meta.store_block_cursor,
+            "record_block_cursor": req_meta.record_block_cursor,
             "allocated_group_lens": [
                 len(group_blocks) for group_blocks in req_meta.allocated_group_block_ids
             ],
-            "recorded_block_count": len(recorded_blocks),
-            "recorded_block_range": recorded_range,
-            "sample_row_segment_lens": sample_rows,
         }
 
     def _record_ready_group_block_ids(
@@ -1479,23 +1462,19 @@ class UCMFAWAConnector(UCMDirectConnector):
         if not allocated_group_block_ids:
             return
         max_full_blocks = req_meta.num_token_ids // self.hash_block_size
-        start_block = self._get_contiguous_recorded_end_block(
-            req_meta,
-            0,
-            max_full_blocks,
-        )
         # Continue from the first unrecorded canonical block. Later chunk
         # prefill steps may append enough group blocks to complete more rows.
-        for canonical_block_idx in range(start_block, max_full_blocks):
-            allow_null_tail = canonical_block_idx < req_meta.total_hit_block_num - 1
+        # The cursor avoids rescanning already recorded rows on every scheduler tick.
+        for canonical_block_idx in range(
+            req_meta.record_block_cursor, max_full_blocks
+        ):
             group_block_ids = self._try_select_group_block_ids(
                 allocated_group_block_ids,
                 (canonical_block_idx + 1) * self.hash_block_size,
-                allow_null_tail=allow_null_tail,
             )
             if group_block_ids is None:
                 break
-            req_meta.group_block_ids[canonical_block_idx] = group_block_ids
+            req_meta.record_block_cursor = canonical_block_idx + 1
 
     def _lookup_external_hit_blocks(self, external_keys: list[bytes]) -> int:
         if self.fa_store is None:
@@ -1503,8 +1482,17 @@ class UCMFAWAConnector(UCMDirectConnector):
         if self.wa_store is None:
             raise RuntimeError("WA store is not initialized.")
         fa_hit_blocks = self.fa_store.lookup_on_prefix(external_keys) + 1
-        window_hit_blocks = self.wa_store.lookup_on_prefix(external_keys) + 1
-        return min(fa_hit_blocks, window_hit_blocks)
+        if fa_hit_blocks <= 0:
+            return 0
+
+        # WA rows represent window boundary state, so they are not required to
+        # form a prefix. Search only inside the FA-contiguous hit range and use
+        # the latest boundary that exists.
+        window_hits = self.wa_store.lookup(external_keys[:fa_hit_blocks])
+        for hit_idx in range(len(window_hits) - 1, -1, -1):
+            if window_hits[hit_idx]:
+                return hit_idx + 1
+        return 0
 
     def get_num_new_matched_tokens(
         self,
@@ -1524,10 +1512,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         if self.persist_token_threshold > request.num_tokens:
             return 0, False
 
-        external_keys = [
-            self._block_key(block_hash)
-            for block_hash in canonical_hashes[hbm_hit_block_num:]
-        ]
+        external_keys = canonical_hashes[hbm_hit_block_num:]
         if not external_keys:
             return 0, False
 
@@ -1553,6 +1538,7 @@ class UCMFAWAConnector(UCMDirectConnector):
             num_token_ids=len(request.all_token_ids),
             token_processed=num_total_hit_tokens,
             store_block_cursor=total_hit_block_num,
+            record_block_cursor=0,
         )
 
         logger.info_once(
@@ -1649,12 +1635,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         start_block: int,
         stop_block: int,
     ) -> int:
-        end_block = start_block
-        for block_idx in range(start_block, stop_block):
-            if block_idx not in req_meta.group_block_ids:
-                break
-            end_block = block_idx + 1
-        return end_block
+        return min(stop_block, req_meta.record_block_cursor)
 
     def _block_keys_and_rows(
         self,
@@ -1663,9 +1644,35 @@ class UCMFAWAConnector(UCMDirectConnector):
     ) -> tuple[list[bytes], KVCacheGroupRows]:
         indices = list(block_indices)
         return (
-            [self._block_key(req_meta.ucm_block_ids[idx]) for idx in indices],
-            [req_meta.group_block_ids[idx] for idx in indices],
+            [req_meta.ucm_block_ids[idx] for idx in indices],
+            self._group_rows_for_indices(req_meta, indices),
         )
+
+    def _group_rows_for_indices(
+        self,
+        req_meta: FAWARequestMeta,
+        block_indices: list[int],
+    ) -> KVCacheGroupRows:
+        if not block_indices:
+            return []
+
+        block_indices_np = np.asarray(block_indices, dtype=np.int64)
+        computed_end_tokens = (
+            (block_indices_np + 1) * np.int64(self.hash_block_size)
+        ).tolist()
+
+        rows: KVCacheGroupRows = []
+        for block_idx, computed_end_token in zip(block_indices, computed_end_tokens):
+            group_row = self._try_select_group_block_ids(
+                req_meta.allocated_group_block_ids,
+                computed_end_token,
+            )
+            if group_row is None:
+                raise RuntimeError(
+                    f"FAWA canonical block {block_idx} is not fully allocated."
+                )
+            rows.append(group_row)
+        return rows
 
     @staticmethod
     def _scheduled_cached_new_block_ids(
@@ -1861,7 +1868,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                 window_ptrs = self._extract_group_addrs(
                     window_rows,
                     self.window_group_ids,
-                    scratch_for_missing=True,
                 )
                 tasks.append(
                     self._submit_load_task(
@@ -1900,42 +1906,86 @@ class UCMFAWAConnector(UCMDirectConnector):
             if self.wa_store is None:
                 raise RuntimeError("WA store is not initialized.")
 
+            if not getattr(self, "_ascend_layout", False):
+                for request in metadata.request_meta.values():
+                    req_keys, req_group_rows = request.dump_block_ids
+                    if not req_keys:
+                        continue
+
+                    tasks: list[FAWADumpTask] = []
+                    fa_ptrs = self._extract_group_addrs(
+                        self._select_rows(req_group_rows, self.fa_group_ids),
+                        self.fa_group_ids,
+                    )
+                    tasks.append(
+                        self._submit_dump_task(
+                            "FA",
+                            self.fa_store,
+                            req_keys,
+                            fa_ptrs,
+                            event_handle,
+                        )
+                    )
+                    window_ptrs = self._extract_group_addrs(
+                        self._select_rows(req_group_rows, self.window_group_ids),
+                        self.window_group_ids,
+                    )
+                    tasks.append(
+                        self._submit_dump_task(
+                            "WA",
+                            self.wa_store,
+                            req_keys,
+                            window_ptrs,
+                            event_handle,
+                        )
+                    )
+                    for dump_task in tasks:
+                        self._wait_dump_task(dump_task)
+                return
+
+            total_keys: list[bytes] = []
+            total_group_rows: KVCacheGroupRows = []
             for request in metadata.request_meta.values():
                 req_keys, req_group_rows = request.dump_block_ids
                 if not req_keys:
                     continue
+                total_keys.extend(req_keys)
+                total_group_rows.extend(req_group_rows)
 
-                tasks: list[FAWADumpTask] = []
-                # Dump the same canonical keys to both stores with different rows.
-                fa_ptrs = self._extract_group_addrs(
-                    self._select_rows(req_group_rows, self.fa_group_ids),
-                    self.fa_group_ids,
+            if not total_keys:
+                return
+
+            tasks: list[FAWADumpTask] = []
+            # Batch all request rows in one worker call; this keeps metadata
+            # dispatch order while avoiding one FA/WA task pair per request.
+            fa_ptrs = self._extract_group_addrs(
+                self._select_rows(total_group_rows, self.fa_group_ids),
+                self.fa_group_ids,
+            )
+            tasks.append(
+                self._submit_dump_task(
+                    "FA",
+                    self.fa_store,
+                    total_keys,
+                    fa_ptrs,
+                    event_handle,
                 )
-                tasks.append(
-                    self._submit_dump_task(
-                        "FA",
-                        self.fa_store,
-                        req_keys,
-                        fa_ptrs,
-                        event_handle,
-                    )
+            )
+            window_ptrs = self._extract_group_addrs(
+                self._select_rows(total_group_rows, self.window_group_ids),
+                self.window_group_ids,
+            )
+            tasks.append(
+                self._submit_dump_task(
+                    "WA",
+                    self.wa_store,
+                    total_keys,
+                    window_ptrs,
+                    event_handle,
                 )
-                window_ptrs = self._extract_group_addrs(
-                    self._select_rows(req_group_rows, self.window_group_ids),
-                    self.window_group_ids,
-                    scratch_for_missing=True,
-                )
-                tasks.append(
-                    self._submit_dump_task(
-                        "WA",
-                        self.wa_store,
-                        req_keys,
-                        window_ptrs,
-                        event_handle,
-                    )
-                )
-                for dump_task in tasks:
-                    self._wait_dump_task(dump_task)
+            )
+            for dump_task in tasks:
+                self._wait_dump_task(dump_task)
         except Exception as e:
             logger.error(f"dump FAWA kv cache failed. {type(e).__name__}: {e}")
 
@@ -2047,20 +2097,6 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
         computed_end_token: Optional[int] = None,
     ) -> KVCacheSegment:
         segment = super()._block_index_to_segment(group_id, group_block_idx, block_id)
-        return self._trim_window_segment(
-            group_id,
-            group_block_idx,
-            computed_end_token,
-            segment,
-        )
-
-    def _make_missing_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        computed_end_token: Optional[int] = None,
-    ) -> KVCacheSegment:
-        segment = super()._make_missing_segment(group_id, group_block_idx)
         return self._trim_window_segment(
             group_id,
             group_block_idx,

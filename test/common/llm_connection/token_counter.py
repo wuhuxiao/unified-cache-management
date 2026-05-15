@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from pathlib import Path
 from typing import List, Set
 
 
@@ -16,11 +17,21 @@ class TokenizerBase:
 class HuggingFaceTokenizer(TokenizerBase):
     def __init__(self, tokenizer_path: str) -> None:
         try:
-            from transformers import AutoTokenizer, PreTrainedTokenizerBase
-
-            self._tok: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(
-                tokenizer_path, trust_remote_code=True
+            from transformers import (
+                AutoTokenizer,
+                PreTrainedTokenizerBase,
+                PreTrainedTokenizerFast,
             )
+
+            tokenizer_json = Path(tokenizer_path) / "tokenizer.json"
+            if tokenizer_json.exists():
+                self._tok: PreTrainedTokenizerBase = PreTrainedTokenizerFast(
+                    tokenizer_file=str(tokenizer_json)
+                )
+            else:
+                self._tok = AutoTokenizer.from_pretrained(
+                    tokenizer_path, trust_remote_code=True
+                )
         except Exception as exc:
             raise TokenizerError(
                 f"Failed to load tokenizer {tokenizer_path!r}: {exc}"

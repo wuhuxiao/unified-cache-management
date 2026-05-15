@@ -1,0 +1,4 @@
+interface:
+  display_name: "vLLM UCM FAWA Dev"
+  short_description: "Develop and debug UCMFAWAConnector HMA behavior."
+  default_prompt: "Help me develop, debug, or validate UCMFAWAConnector in vLLM UCM."
