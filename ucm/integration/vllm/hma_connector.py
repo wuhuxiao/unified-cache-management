@@ -427,12 +427,6 @@ class KVCacheGroupLayout:
             )
         return int(self.view_tensor_block_sizes[0])
 
-
-
-# Multiple canonical hash blocks, each represented as one KVCacheGroupRow.
-KVCacheGroupRows = list[list]
-
-
 class FAWABlockSpanLayout:
     """Maps FAWA canonical hash blocks to per-group KV cache spans."""
 
@@ -1663,6 +1657,14 @@ class UCMFAWAConnector(UCMDirectConnector):
         self._invalid_block_ids = set()
         return res
 
+    @staticmethod
+    def _first_group_anchor_ids(
+        candidate_vllm_ids: tuple[list[int], ...],
+    ) -> set[int]:
+        if not candidate_vllm_ids:
+            return set()
+        return {block_id for block_id in candidate_vllm_ids[0] if block_id >= 0}
+
     def _submit_dump_task(
         self,
         label: str,
@@ -1836,35 +1838,42 @@ class UCMFAWAConnector(UCMDirectConnector):
 
         tasks: list[FAWALoadTask] = []
         for request_id, request in metadata.request_meta.items():
-            store_keys = request.load_keys
-            hash_start = request.load_hash_start
-            hash_end = request.load_hash_end
-            candidate_vllm_ids = request.load_vllm_block_ids
-            if not store_keys:
+            if not request.load_keys:
                 continue
+            anchor_vllm_block_ids = self._first_group_anchor_ids(
+                request.load_vllm_block_ids
+            )
             try:
+                if self.fa_store is None:
+                    raise RuntimeError("FA store is not initialized.")
+                if self.wa_store is None:
+                    raise RuntimeError("WA store is not initialized.")
+
                 # FA groups are loaded for every external-hit canonical block.
-                fa_ptrs = self._extract_fa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
+                fa_ptrs = self._extract_fa_ptr(
+                    request.load_keys,
+                    request.load_hash_start,
+                    request.load_hash_end,
+                    request.load_vllm_block_ids,
+                )
                 tasks.append(
                     self._submit_load_task(
                         request_id,
                         "FA",
                         self.fa_store,
-                        store_keys,
+                        request.load_keys,
                         fa_ptrs,
-                        candidate_vllm_ids,
+                        anchor_vllm_block_ids,
                     )
                 )
 
-                if self.wa_store is None:
-                    raise RuntimeError("WA store is not initialized.")
                 # WA groups only need the final matched boundary.
-                window_keys = store_keys[-1:]
+                window_keys = request.load_keys[-1:]
                 window_ptrs = self._extract_wa_ptr(
                     window_keys,
-                    hash_end - 1,
-                    hash_end,
-                    candidate_vllm_ids,
+                    request.load_hash_end - 1,
+                    request.load_hash_end,
+                    request.load_vllm_block_ids,
                 )
                 tasks.append(
                     self._submit_load_task(
@@ -1873,7 +1882,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                         self.wa_store,
                         window_keys,
                         window_ptrs,
-                        candidate_vllm_ids,
+                        anchor_vllm_block_ids,
                     )
                 )
             except Exception as e:
@@ -1881,7 +1890,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                     f"request {request_id} submit FAWA load task "
                     f"error. {type(e).__name__}: {e}"
                 )
-                self._invalid_block_ids.update(candidate_vllm_ids)
+                self._invalid_block_ids.update(anchor_vllm_block_ids)
 
         for load_task in tasks:
             self._wait_load_task(load_task)
@@ -1903,25 +1912,34 @@ class UCMFAWAConnector(UCMDirectConnector):
 
 
             total_keys: list[bytes] = []
-            total_group_rows: KVCacheGroupRows = []
-            fa_ptrs = []
-            window_ptrs = []
+            fa_ptr_rows: list[np.ndarray] = []
+            wa_ptr_rows: list[np.ndarray] = []
             for request in metadata.request_meta.values():
-                store_keys = request.dump_keys
-                hash_start = request.dump_hash_start
-                hash_end = request.dump_hash_end
-                candidate_vllm_ids = request.dump_vllm_block_ids
-                if not store_keys:
+                if not request.dump_keys:
                     continue
-                total_keys.extend(store_keys)
-                req_fa_ptrs = self._extract_fa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
-                req_window_ptrs = self._extract_wa_ptr(store_keys, hash_start, hash_end, candidate_vllm_ids)
-                fa_ptrs.extend(req_fa_ptrs)
-                window_ptrs.extend(req_window_ptrs)
+                total_keys.extend(request.dump_keys)
+                fa_ptr_rows.append(
+                    self._extract_fa_ptr(
+                        request.dump_keys,
+                        request.dump_hash_start,
+                        request.dump_hash_end,
+                        request.dump_vllm_block_ids,
+                    )
+                )
+                wa_ptr_rows.append(
+                    self._extract_wa_ptr(
+                        request.dump_keys,
+                        request.dump_hash_start,
+                        request.dump_hash_end,
+                        request.dump_vllm_block_ids,
+                    )
+                )
 
             if not total_keys:
                 return
 
+            fa_ptrs = np.vstack(fa_ptr_rows)
+            window_ptrs = np.vstack(wa_ptr_rows)
             tasks: list[FAWADumpTask] = []
 
             tasks.append(
