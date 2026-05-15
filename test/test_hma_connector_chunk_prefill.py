@@ -8,7 +8,6 @@ from ucm.integration.vllm.hma_connector import (
     FAWABlockSpanLayout,
     FAWARequestMeta,
     KVCacheGroupLayout,
-    KVCacheSegment,
     UCMAscendFAWAConnector,
     UCMFAWAConnector,
     UCMFAWAConnectorMetadata,
@@ -549,9 +548,11 @@ def make_ascend_connector() -> UCMAscendFAWAConnector:
     connector.group_tensor_block_sizes = (
         connector.block_span_layout.group_tensor_block_sizes
     )
+    connector.group_tensor_block_ratios = connector._get_group_tensor_block_ratios()
     connector.group_tail_blocks = connector._get_group_tail_blocks()
     connector.group_window_spans = connector._get_group_window_spans()
     connector.requests_meta = {}
+    connector._init_group_metas()
     return connector
 
 
@@ -576,7 +577,6 @@ def test_get_num_new_matched_tokens_uses_generated_hashes():
     assert connector.fa_store.lookup_keys == [b"g0", b"g1", b"g2"]
     assert connector.wa_store.lookup_batch_keys == [b"g0", b"g1", b"g2"]
     assert connector.requests_meta["req-3"].token_processed == 768
-    assert connector.requests_meta["req-3"].store_block_cursor == 3
 
 
 def test_window_hit_uses_latest_boundary_inside_fa_hit_range():
@@ -614,32 +614,23 @@ def test_external_hit_records_allocated_blocks_for_load_plan():
         total_hit_block_num=2,
         num_token_ids=768,
         token_processed=512,
-        store_block_cursor=2,
     )
     connector.requests_meta[request.request_id] = req_meta
 
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(10), FakeBlock(11)],
-                [
-                    FakeBlock(100),
-                    FakeBlock(101),
-                    FakeBlock(102),
-                    FakeBlock(103),
-                    FakeBlock(104),
-                    FakeBlock(105),
-                    FakeBlock(106),
-                    FakeBlock(107),
-                ],
-            )
-        ),
-        512,
-    )
-
     scheduler_output = FakeSchedulerOutput(
-        scheduled_new_reqs=[type("ReqData", (), {"req_id": request.request_id})()],
+        scheduled_new_reqs=[
+            type(
+                "ReqData",
+                (),
+                {
+                    "req_id": request.request_id,
+                    "block_ids": (
+                        [10, 11],
+                        [100, 101, 102, 103, 104, 105, 106, 107],
+                    ),
+                },
+            )()
+        ],
         scheduled_cached_reqs=FakeCachedRequestData(
             req_ids=[],
             resumed_req_ids=set(),
@@ -649,14 +640,12 @@ def test_external_hit_records_allocated_blocks_for_load_plan():
         finished_req_ids=set(),
     )
     metadata = connector.build_connector_meta(scheduler_output)
+    dispatch = metadata.request_meta[request.request_id]
 
-    assert metadata.request_meta[request.request_id].load_block_ids == (
-        [b"a", b"b"],
-        [
-            ([10], [103]),
-            ([11], [107]),
-        ],
-    )
+    assert dispatch.load_keys == [b"a", b"b"]
+    assert dispatch.load_hash_start == 0
+    assert dispatch.load_hash_end == 2
+    assert dispatch.load_vllm_block_ids == ([10, 11], [107])
 
 
 def test_ascend_layout_uses_512_token_hash_blocks_and_mixed_spec_sizes():
@@ -740,53 +729,37 @@ def test_ascend_split_uses_tensor_indices_from_registered_layer_tuple():
     assert grouped[2]["layer.extra.swa_b"] is swa_tensor
 
 
-def test_ascend_canonical_blocks_map_to_tensor_block_offsets():
+def test_ascend_candidate_slicing_maps_to_tensor_block_offsets():
     connector = make_ascend_connector()
-    request = FakeRequest("req-ascend-map")
-    req_meta = FAWARequestMeta(
-        ucm_block_ids=[bytes([i]) for i in range(130)],
-        num_token_ids=512 * 130,
-    )
-    connector.requests_meta[request.request_id] = req_meta
-
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(i) for i in range(130)],
-                [FakeBlock(1000 + i) for i in range(520)],
-                [FakeBlock(2000 + i) for i in range(520)],
-                [FakeBlock(3000 + i) for i in range(17)],
-                [FakeBlock(4000 + i) for i in range(2080)],
-                [FakeBlock(5000 + i) for i in range(2080)],
-                [FakeBlock(6000 + i) for i in range(520)],
-                [FakeBlock(7000 + i) for i in range(520)],
-                [FakeBlock(8000 + i) for i in range(5)],
-                [FakeBlock(9000 + i) for i in range(1040)],
-                [FakeBlock(10000 + i) for i in range(1040)],
-            )
-        ),
-        0,
+    group_blocks = tuple(
+        [group_id * 1000 + idx for idx in range(3000)]
+        for group_id in range(len(connector.group_token_block_sizes))
     )
 
-    rows = {
-        block_idx: connector._group_rows_for_indices(req_meta, [block_idx])[0]
-        for block_idx in (0, 7, 8, 31, 32, 128)
-    }
-
-    assert rows[0][0] == [KVCacheSegment(0, 0, 512)]
-    assert rows[0][1] == [KVCacheSegment(1003, 0, 128)]
-    assert rows[0][2] == [KVCacheSegment(2003, 0, 128)]
-    assert rows[0][3] == [KVCacheSegment(3000, 0, 512)]
-    assert rows[7][3] == [KVCacheSegment(3000, 3584, 512)]
-    assert rows[8][3] == [KVCacheSegment(3001, 0, 512)]
-    assert rows[0][4] == [KVCacheSegment(4015, 28, 4)]
-    assert rows[0][6] == [KVCacheSegment(6003, 124, 4)]
-    assert rows[0][8] == [KVCacheSegment(8000, 0, 512)]
-    assert rows[31][8] == [KVCacheSegment(8000, 15872, 512)]
-    assert rows[32][8] == [KVCacheSegment(8001, 0, 512)]
-    assert rows[128][8] == [KVCacheSegment(8004, 0, 512)]
-    assert rows[0][9] == []
+    assert connector._slice_group_block_ids(
+        0, group_blocks[0], 0, 1, window_tail_only=False
+    ) == [0]
+    assert connector._slice_group_block_ids(
+        3, group_blocks[3], 7, 8, window_tail_only=False
+    ) == [3000]
+    assert connector._slice_group_block_ids(
+        3, group_blocks[3], 8, 9, window_tail_only=False
+    ) == [3001]
+    assert connector._slice_group_block_ids(
+        8, group_blocks[8], 31, 32, window_tail_only=False
+    ) == [8000]
+    assert connector._slice_group_block_ids(
+        8, group_blocks[8], 32, 33, window_tail_only=False
+    ) == [8001]
+    assert connector._slice_group_block_ids(
+        4, group_blocks[4], 0, 1, window_tail_only=True
+    ) == [4015]
+    assert connector._slice_group_block_ids(
+        6, group_blocks[6], 0, 1, window_tail_only=True
+    ) == [6003]
+    assert connector._slice_group_block_ids(
+        9, group_blocks[9], 0, 1, window_tail_only=True
+    ) == []
 
 
 def test_ascend_wa_store_loads_only_final_external_boundary_and_dumps_each_boundary():
@@ -798,9 +771,7 @@ def test_ascend_wa_store_loads_only_final_external_boundary_and_dumps_each_bound
         total_hit_block_num=2,
         num_token_ids=1536,
         token_processed=1024,
-        store_block_cursor=2,
-        record_block_cursor=3,
-        allocated_group_block_ids=(
+        vllm_block_ids=(
             [0, 1, 2],
             [0, 1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14],
             [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 23, 24],
@@ -816,36 +787,31 @@ def test_ascend_wa_store_loads_only_final_external_boundary_and_dumps_each_bound
     )
     connector.requests_meta["req-ascend-load-dump"] = req_meta
 
-    metadata = connector._make_dispatch_meta(
-        "req-ascend-load-dump",
+    metadata = connector._generate_dispatch_meta(
         req_meta,
         512,
+        tuple([] for _ in connector.group_metas),
         True,
     )
 
-    expected_rows = connector._group_rows_for_indices(req_meta, [0, 1, 2])
-    assert metadata.load_block_ids == (
-        [b"a", b"b"],
-        expected_rows[:2],
-    )
-    assert connector._select_rows(
-        metadata.load_block_ids[1][-1:], connector.window_group_ids
-    ) == [
-        (
-            [KVCacheSegment(7, 0, 128)],
-            [KVCacheSegment(17, 0, 128)],
-            [KVCacheSegment(27, 28, 4)],
-            [KVCacheSegment(37, 28, 4)],
-            [KVCacheSegment(47, 124, 4)],
-            [KVCacheSegment(57, 124, 4)],
-            [],
-            [],
-        )
-    ]
-    assert metadata.dump_block_ids == (
-        [b"c"],
-        expected_rows[2:],
-    )
+    assert metadata.load_keys == [b"a", b"b"]
+    assert metadata.load_hash_start == 0
+    assert metadata.load_hash_end == 2
+    assert metadata.load_vllm_block_ids[0] == [0, 1]
+    assert metadata.load_vllm_block_ids[1] == [7]
+    assert metadata.load_vllm_block_ids[2] == [17]
+    assert metadata.load_vllm_block_ids[4] == [27]
+    assert metadata.load_vllm_block_ids[5] == [37]
+    assert metadata.load_vllm_block_ids[6] == [47]
+    assert metadata.load_vllm_block_ids[7] == [57]
+    assert metadata.load_vllm_block_ids[9] == []
+    assert metadata.load_vllm_block_ids[10] == []
+    assert metadata.dump_keys == [b"c"]
+    assert metadata.dump_hash_start == 2
+    assert metadata.dump_hash_end == 3
+    assert metadata.dump_vllm_block_ids[0] == [2]
+    assert metadata.dump_vllm_block_ids[1] == [14]
+    assert metadata.dump_vllm_block_ids[4] == [31]
 
 
 def test_ascend_window_tensor_sizes_use_trimmed_state_spans():
@@ -864,7 +830,7 @@ def test_ascend_window_tensor_sizes_use_trimmed_state_spans():
     ]
 
 
-def test_ascend_chunk_prefill_waits_for_complete_segment_rows():
+def test_ascend_chunk_prefill_emits_incremental_range_metadata():
     connector = make_ascend_connector()
     request = FakeRequest("req-ascend-chunk")
     req_meta = FAWARequestMeta(
@@ -873,28 +839,6 @@ def test_ascend_chunk_prefill_waits_for_complete_segment_rows():
     )
     connector.requests_meta[request.request_id] = req_meta
 
-    connector.update_state_after_alloc(
-        request,
-        FakeKVCacheBlocks(
-            (
-                [FakeBlock(i) for i in range(8)],
-                [],
-                [FakeBlock(2000 + i) for i in range(32)],
-                [FakeBlock(3000)],
-                [FakeBlock(4000 + i) for i in range(128)],
-                [FakeBlock(5000 + i) for i in range(128)],
-                [FakeBlock(6000 + i) for i in range(32)],
-                [FakeBlock(7000 + i) for i in range(32)],
-                [FakeBlock(8000)],
-                [FakeBlock(9000 + i) for i in range(64)],
-                [FakeBlock(10000 + i) for i in range(64)],
-            )
-        ),
-        0,
-    )
-
-    assert req_meta.record_block_cursor == 0
-
     scheduler_output = FakeSchedulerOutput(
         scheduled_new_reqs=[],
         scheduled_cached_reqs=FakeCachedRequestData(
@@ -902,38 +846,42 @@ def test_ascend_chunk_prefill_waits_for_complete_segment_rows():
             resumed_req_ids=set(),
             new_block_ids=[
                 (
-                    [],
+                    [0],
                     [1000 + i for i in range(32)],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
-                    [],
+                    [2000 + i for i in range(32)],
+                    [3000],
+                    [4000 + i for i in range(128)],
+                    [5000 + i for i in range(128)],
+                    [6000 + i for i in range(32)],
+                    [7000 + i for i in range(32)],
+                    [8000],
                     [],
                     [],
                 )
             ],
         ),
-        num_scheduled_tokens={request.request_id: 4096},
+        num_scheduled_tokens={request.request_id: 512},
         finished_req_ids=set(),
     )
     metadata = connector.build_connector_meta(scheduler_output)
+    dispatch = metadata.request_meta[request.request_id]
 
-    assert len(metadata.request_meta[request.request_id].dump_block_ids[0]) == 8
-    assert metadata.request_meta[request.request_id].dump_block_ids[1][7][3] == [
-        KVCacheSegment(3000, 3584, 512)
-    ]
-    assert req_meta.store_block_cursor == 8
+    assert dispatch.dump_keys == [b"a"]
+    assert dispatch.dump_hash_start == 0
+    assert dispatch.dump_hash_end == 1
+    assert dispatch.dump_vllm_block_ids[0] == [0]
+    assert dispatch.dump_vllm_block_ids[1] == [1003]
+    assert dispatch.dump_vllm_block_ids[3] == [3000]
+    assert req_meta.token_processed == 512
 
 
-def test_layout_extracts_segment_addresses_and_sizes():
+def test_layout_extracts_batch_addresses_and_sizes():
     tensor = torch.empty((2, 128, 3), dtype=torch.float32)
     layout = KVCacheGroupLayout({"layer.0": tensor})
 
-    addrs = layout.extract_segment_addrs(
-        [KVCacheSegment(1, 4096, 512)],
+    addrs = layout.extract_segment_addrs_batch(
+        np.asarray([1], dtype=np.int64),
+        np.asarray([4096], dtype=np.int64),
         group_tensor_block_size=16384,
     )
 
@@ -1018,15 +966,12 @@ def test_layout_handles_single_4d_ascend_tensor_shape():
     tensor = torch.empty((2, 128, 1, 512), dtype=torch.bfloat16)
     layout = KVCacheGroupLayout({"layer.0": tensor})
 
-    addrs = layout.extract_segment_addrs(
-        [KVCacheSegment(1, 512, 512)],
+    addrs = layout.extract_segment_addrs_batch(
+        np.asarray([1], dtype=np.int64),
+        np.asarray([512], dtype=np.int64),
         group_tensor_block_size=16384,
     )
     block_views = layout.extract_block_tensor_views([1])
-    segment_views = layout.extract_segment_tensor_views(
-        [KVCacheSegment(1, 512, 512)],
-        group_tensor_block_size=16384,
-    )
 
     assert layout.tensor_size_list == [int(tensor[0].numel() * tensor.element_size())]
     assert addrs.shape == (1, 1)
@@ -1037,24 +982,18 @@ def test_layout_handles_single_4d_ascend_tensor_shape():
     assert len(block_views) == 1
     assert block_views[0].shape == tensor[1].shape
     assert block_views[0].data_ptr() == tensor[1].data_ptr()
-    assert len(segment_views) == 1
-    assert segment_views[0].shape == tensor[1, 4:8].shape
-    assert segment_views[0].data_ptr() == tensor[1, 4:8].data_ptr()
 
 
 def test_layout_handles_gpu_4d_kv_axis_before_tensor_block_size():
     tensor = torch.empty((2, 2, 64, 3), dtype=torch.float32)
     layout = KVCacheGroupLayout({"layer.0": tensor})
 
-    addrs = layout.extract_segment_addrs(
-        [KVCacheSegment(1, 0, 64)],
+    addrs = layout.extract_segment_addrs_batch(
+        np.asarray([1], dtype=np.int64),
+        np.asarray([0], dtype=np.int64),
         group_tensor_block_size=64,
     )
     block_views = layout.extract_block_tensor_views([1])
-    segment_views = layout.extract_segment_tensor_views(
-        [KVCacheSegment(1, 0, 64)],
-        group_tensor_block_size=64,
-    )
 
     assert layout.tensor_block_size == 64
     assert layout.tensor_size_list == [
@@ -1067,9 +1006,6 @@ def test_layout_handles_gpu_4d_kv_axis_before_tensor_block_size():
     assert len(block_views) == 2
     assert block_views[0].data_ptr() == tensor[1, 0].data_ptr()
     assert block_views[1].data_ptr() == tensor[1, 1].data_ptr()
-    assert len(segment_views) == 2
-    assert segment_views[0].data_ptr() == tensor[1, 0].data_ptr()
-    assert segment_views[1].data_ptr() == tensor[1, 1].data_ptr()
 
 
 def test_layout_handles_mixed_3d_tensor_block_sizes():
@@ -1082,15 +1018,12 @@ def test_layout_handles_mixed_3d_tensor_block_sizes():
         }
     )
 
-    addrs = layout.extract_segment_addrs(
-        [KVCacheSegment(1, 128, 128)],
+    addrs = layout.extract_segment_addrs_batch(
+        np.asarray([1], dtype=np.int64),
+        np.asarray([128], dtype=np.int64),
         group_tensor_block_size=256,
     )
     block_views = layout.extract_block_tensor_views([1])
-    segment_views = layout.extract_segment_tensor_views(
-        [KVCacheSegment(1, 128, 128)],
-        group_tensor_block_size=256,
-    )
 
     assert layout.tensor_size_list == [
         int(tensor64[0].numel() * tensor64.element_size()),
@@ -1106,9 +1039,6 @@ def test_layout_handles_mixed_3d_tensor_block_sizes():
     assert len(block_views) == 2
     assert block_views[0].data_ptr() == tensor64[1].data_ptr()
     assert block_views[1].data_ptr() == tensor2[1].data_ptr()
-    assert len(segment_views) == 2
-    assert segment_views[0].data_ptr() == tensor64[1, 32:64].data_ptr()
-    assert segment_views[1].data_ptr() == tensor2[1, 1:2].data_ptr()
 
 
 if __name__ == "__main__":

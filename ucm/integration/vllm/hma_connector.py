@@ -31,24 +31,6 @@ logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
-class KVCacheSegment:
-    block_id: int
-    offset: int = 0
-    length: int = 0
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, int):
-            return self.block_id == other and self.offset == 0
-        if not isinstance(other, KVCacheSegment):
-            return False
-        return (
-            self.block_id == other.block_id
-            and self.offset == other.offset
-            and self.length == other.length
-        )
-
-
-@dataclass(frozen=True)
 class KVCacheGroupMeta:
     group_id: int
     token_block_size: int
@@ -257,57 +239,6 @@ class KVCacheGroupLayout:
             )
         return scaled // group_size
 
-    def extract_segment_addrs_flat(
-        self,
-        segment: KVCacheSegment,
-        group_tensor_block_size: int,
-    ) -> np.ndarray:
-        if segment.block_id < 0:
-            raise ValueError("Negative KV cache block id needs a scratch target.")
-        # The offset conversion is reused heavily by load/dump metadata dispatch.
-        tensor_offsets = self._tensor_tokens_for_logical(
-            segment.offset,
-            group_tensor_block_size,
-        )
-        return (
-            np.uint64(segment.block_id) * self.block_strides
-            + tensor_offsets * self.token_strides
-            + self.base_ptrs
-        ).astype(np.uint64, copy=False)
-
-    def extract_segment_addrs(
-        self,
-        segments: list[KVCacheSegment],
-        group_tensor_block_size: int,
-    ) -> np.ndarray:
-        if not segments:
-            return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
-        if len(segments) == 1:
-            return self.extract_segment_addrs_flat(
-                segments[0],
-                group_tensor_block_size,
-            ).reshape(1, -1)
-
-        block_ids_np = np.fromiter(
-            (segment.block_id for segment in segments),
-            dtype=np.uint64,
-            count=len(segments),
-        )
-        offsets_np = np.vstack(
-            [
-                self._tensor_tokens_for_logical(
-                    segment.offset,
-                    group_tensor_block_size,
-                )
-                for segment in segments
-            ]
-        )
-        return (
-            block_ids_np[:, None] * self.block_strides[None, :]
-            + offsets_np * self.token_strides[None, :]
-            + self.base_ptrs[None, :]
-        ).astype(np.uint64, copy=False)
-
     def extract_segment_addrs_batch(
         self,
         block_ids: np.ndarray,
@@ -374,36 +305,6 @@ class KVCacheGroupLayout:
         for block_id in vllm_block_ids:
             for tensor in self.view_tensors:
                 tensors.append(tensor[block_id])
-        return tensors
-
-    def extract_segment_tensor_views(
-        self,
-        segments: list[KVCacheSegment],
-        group_tensor_block_size: int,
-    ) -> list[torch.Tensor]:
-        tensors: list[torch.Tensor] = []
-
-        for segment in segments:
-            tensor_offsets = self._tensor_tokens_for_logical(
-                segment.offset,
-                group_tensor_block_size,
-            )
-            tensor_lengths = self._tensor_tokens_for_logical(
-                segment.length,
-                group_tensor_block_size,
-            )
-            for tensor, tensor_offset, tensor_length in zip(
-                self.view_tensors,
-                tensor_offsets,
-                tensor_lengths,
-            ):
-                tensors.append(
-                    tensor[segment.block_id].narrow(
-                        0,
-                        int(tensor_offset),
-                        int(tensor_length),
-                    )
-                )
         return tensors
 
     @property
@@ -716,28 +617,6 @@ class FAWABlockSpanLayout:
                 f"FAWA Ascend layout has no tensor index mapping for "
                 f"group {group_id}, layer {layer_name}."
             ) from exc
-
-    def block_index_to_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        block_id: int,
-    ) -> KVCacheSegment:
-        group_token_block_size = self.group_token_block_sizes[group_id]
-        token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
-        tensor_block_idx = group_block_idx // token_blocks_per_tensor_block
-        if tensor_block_idx != block_id:
-            logger.debug(
-                f"FAWA group {group_id} logical block idx {group_block_idx} "
-                f"maps to tensor block idx {tensor_block_idx}, "
-                f"allocated id {block_id}."
-            )
-        return KVCacheSegment(
-            block_id=block_id,
-            offset=(group_block_idx % token_blocks_per_tensor_block)
-            * group_token_block_size,
-            length=group_token_block_size,
-        )
 
     def allocation_index(self, group_id: int, group_block_idx: int) -> int:
         return group_block_idx // self._group_tensor_block_ratio(group_id)
@@ -1539,7 +1418,7 @@ class UCMFAWAConnector(UCMDirectConnector):
             dump_hash_end=dump_end,
             dump_vllm_block_ids=tuple(dump_vllm_block_ids),
         )
-    
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1556,7 +1435,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                 )
 
 
-        
         scheduled_cached_reqs = scheduler_output.scheduled_cached_reqs
         for i, request_id in enumerate(scheduled_cached_reqs.req_ids):
             req_meta = self.requests_meta.get(request_id)
@@ -1664,6 +1542,26 @@ class UCMFAWAConnector(UCMDirectConnector):
         if not candidate_vllm_ids:
             return set()
         return {block_id for block_id in candidate_vllm_ids[0] if block_id >= 0}
+
+    def _first_group_anchor_ids_for_hash_range(
+        self,
+        candidate_vllm_ids: tuple[list[int], ...],
+        hash_start: int,
+        hash_end: int,
+        candidate_hash_start: int,
+    ) -> set[int]:
+        if not candidate_vllm_ids or hash_end <= hash_start:
+            return set()
+        first_group_ids = candidate_vllm_ids[0]
+        start = hash_start - candidate_hash_start
+        end = hash_end - candidate_hash_start
+        if start < 0 or end > len(first_group_ids):
+            raise RuntimeError(
+                f"FAWA load anchor range [{hash_start}, {hash_end}) is outside "
+                f"candidate base={candidate_hash_start}, "
+                f"candidates={len(first_group_ids)}."
+            )
+        return {block_id for block_id in first_group_ids[start:end] if block_id >= 0}
 
     def _submit_dump_task(
         self,
@@ -1840,9 +1738,11 @@ class UCMFAWAConnector(UCMDirectConnector):
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
                 continue
-            anchor_vllm_block_ids = self._first_group_anchor_ids(
+            fa_anchor_vllm_block_ids = self._first_group_anchor_ids(
                 request.load_vllm_block_ids
             )
+            wa_anchor_vllm_block_ids = set()
+            current_anchor_vllm_block_ids = fa_anchor_vllm_block_ids
             try:
                 if self.fa_store is None:
                     raise RuntimeError("FA store is not initialized.")
@@ -1863,12 +1763,19 @@ class UCMFAWAConnector(UCMDirectConnector):
                         self.fa_store,
                         request.load_keys,
                         fa_ptrs,
-                        anchor_vllm_block_ids,
+                        fa_anchor_vllm_block_ids,
                     )
                 )
 
                 # WA groups only need the final matched boundary.
                 window_keys = request.load_keys[-1:]
+                wa_anchor_vllm_block_ids = self._first_group_anchor_ids_for_hash_range(
+                    request.load_vllm_block_ids,
+                    request.load_hash_end - 1,
+                    request.load_hash_end,
+                    request.load_hash_start,
+                )
+                current_anchor_vllm_block_ids = wa_anchor_vllm_block_ids
                 window_ptrs = self._extract_wa_ptr(
                     window_keys,
                     request.load_hash_end - 1,
@@ -1882,7 +1789,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                         self.wa_store,
                         window_keys,
                         window_ptrs,
-                        anchor_vllm_block_ids,
+                        wa_anchor_vllm_block_ids,
                     )
                 )
             except Exception as e:
@@ -1890,7 +1797,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                     f"request {request_id} submit FAWA load task "
                     f"error. {type(e).__name__}: {e}"
                 )
-                self._invalid_block_ids.update(anchor_vllm_block_ids)
+                self._invalid_block_ids.update(current_anchor_vllm_block_ids)
 
         for load_task in tasks:
             self._wait_load_task(load_task)
@@ -2043,58 +1950,3 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
                 window_tail_tokens -= segment_tokens
             spans.append(tuple(reversed(group_spans)))
         return tuple(spans)
-
-    def _block_index_to_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        block_id: int,
-        computed_end_token: Optional[int] = None,
-    ) -> KVCacheSegment:
-        segment = super()._block_index_to_segment(group_id, group_block_idx, block_id)
-        return self._trim_window_segment(
-            group_id,
-            group_block_idx,
-            computed_end_token,
-            segment,
-        )
-
-    def _trim_window_segment(
-        self,
-        group_id: int,
-        group_block_idx: int,
-        computed_end_token: Optional[int],
-        segment: KVCacheSegment,
-    ) -> KVCacheSegment:
-        if (
-            group_id not in self.window_group_ids
-            or self.group_tail_blocks[group_id] is None
-            or self.group_tail_blocks[group_id] == 0
-            or self.block_span_layout.is_swa_group(group_id)
-        ):
-            return segment
-
-        window_tail_tokens = self._ascend_window_tail_tokens(group_id)
-        if window_tail_tokens is None:
-            return segment
-        if window_tail_tokens == 0:
-            return segment
-
-        group_token_block_size = self.group_token_block_sizes[group_id]
-        tail_end_token = (
-            computed_end_token
-            if computed_end_token is not None
-            else (group_block_idx + 1) * group_token_block_size
-        )
-        tail_start_token = max(0, tail_end_token - window_tail_tokens)
-        block_start_token = group_block_idx * group_token_block_size
-        segment_start_in_block = max(0, tail_start_token - block_start_token)
-        segment_end_in_block = min(
-            group_token_block_size, tail_end_token - block_start_token
-        )
-        length = max(0, segment_end_in_block - segment_start_in_block)
-        return KVCacheSegment(
-            block_id=segment.block_id,
-            offset=segment.offset + segment_start_in_block,
-            length=length,
-        )

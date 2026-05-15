@@ -9,6 +9,9 @@ from ucm.integration.vllm.hma_connector import (
 
 
 class FailingStore:
+    def load_data(self, keys, shard_indices, ptrs):
+        return ("load", tuple(keys), tuple(shard_indices), ptrs)
+
     def wait(self, task):
         raise RuntimeError("load failed")
 
@@ -59,7 +62,24 @@ def test_first_group_anchor_ids_ignore_negative_values():
     assert connector._first_group_anchor_ids(([], [5], [])) == set()
 
 
-def test_start_load_kv_uses_flat_request_metadata_and_first_group_anchors():
+def test_first_group_anchor_ids_for_hash_range_uses_candidate_base():
+    connector = object.__new__(UCMFAWAConnector)
+
+    assert connector._first_group_anchor_ids_for_hash_range(
+        ([11, -1, 13], [21], [31]),
+        4,
+        5,
+        3,
+    ) == set()
+    assert connector._first_group_anchor_ids_for_hash_range(
+        ([11, -1, 13], [21], [31]),
+        5,
+        6,
+        3,
+    ) == {13}
+
+
+def test_start_load_kv_uses_flat_request_metadata_and_boundary_anchors():
     connector = object.__new__(UCMFAWAConnector)
     connector._invalid_block_ids = set()
     connector.fa_store = RecordingStore()
@@ -69,7 +89,7 @@ def test_start_load_kv_uses_flat_request_metadata_and_first_group_anchors():
         load_keys=[b"a", b"b"],
         load_hash_start=3,
         load_hash_end=5,
-        load_vllm_block_ids=([11, -1, 13], [21], [31]),
+        load_vllm_block_ids=([11, 13], [21], [31]),
     )
     connector._get_connector_metadata = lambda: UCMFAWAConnectorMetadata(
         {"req-0": load_meta}
@@ -90,8 +110,8 @@ def test_start_load_kv_uses_flat_request_metadata_and_first_group_anchors():
 
     connector.start_load_kv(None)
 
-    assert fa_calls == [([b"a", b"b"], 3, 5, ([11, -1, 13], [21], [31]))]
-    assert wa_calls == [([b"b"], 4, 5, ([11, -1, 13], [21], [31]))]
+    assert fa_calls == [([b"a", b"b"], 3, 5, ([11, 13], [21], [31]))]
+    assert wa_calls == [([b"b"], 4, 5, ([11, 13], [21], [31]))]
     assert connector.fa_store.loads[0][:3] == (
         "load",
         (b"a", b"b"),
@@ -103,6 +123,34 @@ def test_start_load_kv_uses_flat_request_metadata_and_first_group_anchors():
     assert connector.fa_store.waited[0][3] == "fa-ptrs"
     assert connector.wa_store.waited[0][3] == "wa-ptrs"
     assert connector._invalid_block_ids == set()
+
+    fa_task = connector.fa_store.waited[0]
+    wa_task = connector.wa_store.waited[0]
+    assert fa_task[3] == "fa-ptrs"
+    assert wa_task[3] == "wa-ptrs"
+
+
+def test_start_load_kv_reports_wa_failure_with_final_boundary_anchor_only():
+    connector = object.__new__(UCMFAWAConnector)
+    connector._invalid_block_ids = set()
+    connector.fa_store = RecordingStore()
+    connector.wa_store = FailingStore()
+
+    load_meta = FAWARequestDispatchMeta(
+        load_keys=[b"a", b"b"],
+        load_hash_start=3,
+        load_hash_end=5,
+        load_vllm_block_ids=([11, 13], [21], [31]),
+    )
+    connector._get_connector_metadata = lambda: UCMFAWAConnectorMetadata(
+        {"req-0": load_meta}
+    )
+    connector._extract_fa_ptr = lambda *args: "fa-ptrs"
+    connector._extract_wa_ptr = lambda *args: "wa-ptrs"
+
+    connector.start_load_kv(None)
+
+    assert connector.get_block_ids_with_load_errors() == {13}
 
 
 def test_wait_for_save_batches_flat_dump_metadata():
