@@ -695,11 +695,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self._ascend_layout = False
         self.hash_block_size = self._get_hash_block_size()
         self.block_size = self.hash_block_size
-        self.group_token_block_sizes = self._get_group_token_block_sizes()
-        self.group_tensor_block_sizes = self._get_group_tensor_block_sizes()
-        self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
-        self.group_tail_blocks = self._get_group_tail_blocks()
-        self.group_window_spans = self._get_group_window_spans()
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
@@ -807,16 +802,53 @@ class UCMFAWAConnector(UCMDirectConnector):
         return tuple(ratios)
 
     def _group_tensor_block_ratio(self, group_id: int) -> int:
-        ratios = getattr(self, "group_tensor_block_ratios", None)
-        if ratios is None:
-            self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
-            ratios = self.group_tensor_block_ratios
-        return ratios[group_id]
+        return self.group_metas[group_id].tensor_block_size // self.group_metas[
+            group_id
+        ].token_block_size
 
     def _init_group_metas(self) -> None:
+        groups = self._kv_cache_config.kv_cache_groups
+        if not groups:
+            raise RuntimeError("FAWA connector found no KV cache groups.")
+
+        token_block_sizes: list[int] = []
+        for group_id, group in enumerate(groups):
+            token_block_size = self._spec_token_block_size(group.kv_cache_spec)
+            if group_id in self.fa_group_ids:
+                token_block_size = self.hash_block_size
+            token_block_sizes.append(token_block_size)
+
+        self._validate_group_token_block_sizes(tuple(token_block_sizes))
+
+        tensor_block_sizes = list(token_block_sizes)
+        tail_blocks: list[Optional[int]] = [None] * len(token_block_sizes)
+        window_spans = [(size,) for size in token_block_sizes]
+
+        for group_id in self.window_group_ids:
+            group_spec = groups[group_id]
+            token_block_size = token_block_sizes[group_id]
+            window_tokens = FAWABlockSpanLayout.group_window_tokens(group_spec)
+            if window_tokens is None:
+                tail_blocks[group_id] = self.hash_block_size // token_block_size
+            elif self._is_compressor_state_group(group_id):
+                tail_blocks[group_id] = self._compressor_state_tail_blocks(
+                    group_id,
+                    window_tokens,
+                    token_block_size,
+                )
+            else:
+                tail_blocks[group_id] = max(1, math.ceil(window_tokens / token_block_size))
+            window_spans[group_id] = (token_block_size,) * int(tail_blocks[group_id])
+
         self.group_metas = {}
-        for group_id, token_block_size in enumerate(self.group_token_block_sizes):
-            tensor_block_size = self.group_tensor_block_sizes[group_id]
+        for group_id, token_block_size in enumerate(token_block_sizes):
+            tensor_block_size = tensor_block_sizes[group_id]
+            if tensor_block_size % token_block_size != 0:
+                raise RuntimeError(
+                    f"FAWA group {group_id} logical block size "
+                    f"{token_block_size} must divide tensor block size "
+                    f"{tensor_block_size}."
+                )
             self.group_metas[group_id] = KVCacheGroupMeta(
                 group_id=group_id,
                 token_block_size=token_block_size,
@@ -828,9 +860,36 @@ class UCMFAWAConnector(UCMDirectConnector):
                     1,
                     tensor_block_size // self.hash_block_size,
                 ),
-                tail_blocks=self.group_tail_blocks[group_id],
-                window_spans=self.group_window_spans[group_id],
+                tail_blocks=tail_blocks[group_id],
+                window_spans=tuple(window_spans[group_id]),
             )
+
+    @property
+    def group_token_block_sizes(self) -> tuple[int, ...]:
+        return tuple(
+            meta.token_block_size for _, meta in sorted(self.group_metas.items())
+        )
+
+    @property
+    def group_tensor_block_sizes(self) -> tuple[int, ...]:
+        return tuple(
+            meta.tensor_block_size for _, meta in sorted(self.group_metas.items())
+        )
+
+    @property
+    def group_tensor_block_ratios(self) -> tuple[int, ...]:
+        return tuple(
+            meta.tensor_block_size // meta.token_block_size
+            for _, meta in sorted(self.group_metas.items())
+        )
+
+    @property
+    def group_tail_blocks(self) -> tuple[int | None, ...]:
+        return tuple(meta.tail_blocks for _, meta in sorted(self.group_metas.items()))
+
+    @property
+    def group_window_spans(self) -> tuple[tuple[int, ...], ...]:
+        return tuple(meta.window_spans for _, meta in sorted(self.group_metas.items()))
 
     def _create_fa_store(
         self,
@@ -1203,13 +1262,14 @@ class UCMFAWAConnector(UCMDirectConnector):
             layout = group_layouts.get(group_id)
             if layout is None:
                 continue
-            repeat = self.group_tail_blocks[group_id]
+            meta = self.group_metas[group_id]
+            repeat = meta.tail_blocks
             if repeat is None:
                 repeat = 1
-            for segment_tokens in self.group_window_spans[group_id][:repeat]:
+            for segment_tokens in meta.window_spans[:repeat]:
                 segment_sizes = layout.segment_tensor_size_list(
                     segment_tokens,
-                    self.group_tensor_block_sizes[group_id],
+                    meta.tensor_block_size,
                 )
                 tensor_size_list.extend(segment_sizes)
         if not tensor_size_list:
@@ -1311,11 +1371,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         if hash_end <= hash_start:
             return []
         meta = self.group_metas[group_id]
-        token_blocks_per_tensor_block = (
-            self.group_tensor_block_ratios[group_id]
-            if hasattr(self, "group_tensor_block_ratios")
-            else meta.tensor_block_size // meta.token_block_size
-        )
+        token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
         if window_tail_only:
             if not meta.tail_blocks:
                 return []

@@ -7,6 +7,7 @@ import torch
 from ucm.integration.vllm.hma_connector import (
     FAWABlockSpanLayout,
     FAWARequestMeta,
+    KVCacheGroupMeta,
     KVCacheGroupLayout,
     UCMAscendFAWAConnector,
     UCMFAWAConnector,
@@ -53,33 +54,66 @@ def make_connector() -> UCMFAWAConnector:
     connector.hash_block_size = 256
     connector.fa_group_ids = (0,)
     connector.window_group_ids = (1,)
-    connector.group_token_block_sizes = (256, 64)
-    connector.group_tensor_block_sizes = connector.group_token_block_sizes
-    connector.group_tensor_block_ratios = (1, 1)
-    connector.group_tail_blocks = (None, 1)
-    connector.group_window_spans = ((256,), (64,))
     connector.block_span_layout = None
     connector.requests_meta = {}
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(256, 64),
+        tensor_block_sizes=(256, 64),
+        tail_blocks=(None, 1),
+        window_spans=((256,), (64,)),
+    )
     return connector
+
+
+def set_group_metas(
+    connector: UCMFAWAConnector,
+    *,
+    token_block_sizes: tuple[int, ...],
+    tensor_block_sizes: tuple[int, ...],
+    tail_blocks: tuple[int | None, ...],
+    window_spans: tuple[tuple[int, ...], ...],
+) -> None:
+    connector.group_metas = {
+        group_id: KVCacheGroupMeta(
+            group_id=group_id,
+            token_block_size=token_block_size,
+            tensor_block_size=tensor_block_sizes[group_id],
+            logical_blocks_per_hash_block=connector.hash_block_size
+            // token_block_size,
+            hash_blocks_per_tensor_block=max(
+                1,
+                tensor_block_sizes[group_id] // connector.hash_block_size,
+            ),
+            tail_blocks=tail_blocks[group_id],
+            window_spans=window_spans[group_id],
+        )
+        for group_id, token_block_size in enumerate(token_block_sizes)
+    }
 
 
 def make_two_tail_connector() -> UCMFAWAConnector:
     connector = make_connector()
-    connector.group_tail_blocks = (None, 2)
-    connector.group_window_spans = ((256,), (64, 64))
+    set_group_metas(
+        connector,
+        token_block_sizes=(256, 64),
+        tensor_block_sizes=(256, 64),
+        tail_blocks=(None, 2),
+        window_spans=((256,), (64, 64)),
+    )
     return connector
 
 
 def test_group_meta_uses_integer_ratios_and_zero_tail():
     connector = make_connector()
-    connector.group_token_block_sizes = (256, 64, 64)
-    connector.group_tensor_block_sizes = (256, 512, 64)
-    connector.group_tail_blocks = (None, 1, 0)
-    connector.group_window_spans = ((256,), (64,), ())
     connector.window_group_ids = (1, 2)
-
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(256, 64, 64),
+        tensor_block_sizes=(256, 512, 64),
+        tail_blocks=(None, 1, 0),
+        window_spans=((256,), (64,), ()),
+    )
 
     assert connector.group_metas[0].logical_blocks_per_hash_block == 1
     assert connector.group_metas[0].hash_blocks_per_tensor_block == 1
@@ -211,13 +245,14 @@ def test_load_metadata_slices_wa_to_final_boundary():
 
 def test_zero_tail_window_group_uses_empty_candidate_list():
     connector = make_connector()
-    connector.group_token_block_sizes = (256, 64, 64)
-    connector.group_tensor_block_sizes = connector.group_token_block_sizes
-    connector.group_tensor_block_ratios = (1, 1, 1)
-    connector.group_tail_blocks = (None, 1, 0)
-    connector.group_window_spans = ((256,), (64,), ())
     connector.window_group_ids = (1, 2)
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(256, 64, 64),
+        tensor_block_sizes=(256, 64, 64),
+        tail_blocks=(None, 1, 0),
+        window_spans=((256,), (64,), ()),
+    )
 
     req_meta = FAWARequestMeta(
         ucm_block_ids=[b"a"],
@@ -294,14 +329,15 @@ def test_cached_resumed_from_preemption_list_resets_only_matching_request():
 def test_slice_group_block_ids_uses_tensor_block_ratio_for_large_blocks():
     connector = make_connector()
     connector.hash_block_size = 256
-    connector.group_token_block_sizes = (64, 64)
-    connector.group_tensor_block_sizes = (512, 512)
-    connector.group_tensor_block_ratios = (8, 8)
     connector.fa_group_ids = (0,)
     connector.window_group_ids = (1,)
-    connector.group_tail_blocks = (None, 1)
-    connector.group_window_spans = ((256,), (64,))
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(64, 64),
+        tensor_block_sizes=(512, 512),
+        tail_blocks=(None, 1),
+        window_spans=((256,), (64,)),
+    )
 
     assert connector._slice_group_block_ids(
         0,
@@ -338,12 +374,13 @@ def test_extract_fa_ptr_batches_hash_offsets_for_shared_tensor_block():
     connector.hash_block_size = 512
     connector.fa_group_ids = (0,)
     connector.window_group_ids = ()
-    connector.group_token_block_sizes = (512,)
-    connector.group_tensor_block_sizes = (4096,)
-    connector.group_tensor_block_ratios = (8,)
-    connector.group_tail_blocks = (None,)
-    connector.group_window_spans = ((512,),)
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(512,),
+        tensor_block_sizes=(4096,),
+        tail_blocks=(None,),
+        window_spans=((512,),),
+    )
     tensor = torch.empty((5, 4096, 1), dtype=torch.float32)
     connector.group_layouts = {0: KVCacheGroupLayout({"layer.0": tensor})}
 
@@ -361,14 +398,15 @@ def test_extract_fa_ptr_batches_hash_offsets_for_shared_tensor_block():
 
 def test_extract_wa_ptr_uses_tail_candidates_and_zero_tail_group():
     connector = make_connector()
-    connector.group_token_block_sizes = (256, 64, 64)
-    connector.group_tensor_block_sizes = connector.group_token_block_sizes
-    connector.group_tensor_block_ratios = (1, 1, 1)
     connector.fa_group_ids = (0,)
     connector.window_group_ids = (1, 2)
-    connector.group_tail_blocks = (None, 1, 0)
-    connector.group_window_spans = ((256,), (64,), ())
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(256, 64, 64),
+        tensor_block_sizes=(256, 64, 64),
+        tail_blocks=(None, 1, 0),
+        window_spans=((256,), (64,), ()),
+    )
     window_tensor = torch.empty((16, 64, 1), dtype=torch.float32)
     zero_tail_tensor = torch.empty((16, 64, 1), dtype=torch.float32)
     connector.group_layouts = {
@@ -391,14 +429,15 @@ def test_extract_wa_ptr_uses_tail_candidates_and_zero_tail_group():
 def test_extract_wa_ptr_offsets_trimmed_window_span_to_tail_start():
     connector = make_connector()
     connector.hash_block_size = 32
-    connector.group_token_block_sizes = (32, 32)
-    connector.group_tensor_block_sizes = connector.group_token_block_sizes
-    connector.group_tensor_block_ratios = (1, 1)
     connector.fa_group_ids = (0,)
     connector.window_group_ids = (1,)
-    connector.group_tail_blocks = (None, 1)
-    connector.group_window_spans = ((32,), (4,))
-    connector._init_group_metas()
+    set_group_metas(
+        connector,
+        token_block_sizes=(32, 32),
+        tensor_block_sizes=(32, 32),
+        tail_blocks=(None, 1),
+        window_spans=((32,), (4,)),
+    )
     tensor = torch.empty((8, 32, 1), dtype=torch.float32)
     connector.group_layouts = {1: KVCacheGroupLayout({"layer.0.wa": tensor})}
 
@@ -572,17 +611,38 @@ def make_ascend_connector() -> UCMAscendFAWAConnector:
     )
     connector._ascend_layout = connector.block_span_layout.is_ascend
     connector.hash_block_size = connector.block_span_layout.hash_block_size
-    connector.group_token_block_sizes = (
-        connector.block_span_layout.group_token_block_sizes
+    set_group_metas(
+        connector,
+        token_block_sizes=connector.block_span_layout.group_token_block_sizes,
+        tensor_block_sizes=connector.block_span_layout.group_tensor_block_sizes,
+        tail_blocks=(
+            None,
+            1,
+            1,
+            None,
+            1,
+            1,
+            1,
+            1,
+            None,
+            0,
+            0,
+        ),
+        window_spans=(
+            (512,),
+            (128,),
+            (128,),
+            (512,),
+            (4,),
+            (4,),
+            (4,),
+            (4,),
+            (512,),
+            (),
+            (),
+        ),
     )
-    connector.group_tensor_block_sizes = (
-        connector.block_span_layout.group_tensor_block_sizes
-    )
-    connector.group_tensor_block_ratios = connector._get_group_tensor_block_ratios()
-    connector.group_tail_blocks = connector._get_group_tail_blocks()
-    connector.group_window_spans = connector._get_group_window_spans()
     connector.requests_meta = {}
-    connector._init_group_metas()
     return connector
 
 
