@@ -506,69 +506,6 @@ class FAWABlockSpanLayout:
             return self.hash_block_size
         return self.spec_token_block_size(group_spec.kv_cache_spec)
 
-    def _get_group_token_block_sizes(self) -> tuple[int, ...]:
-        groups = self.kv_cache_config.kv_cache_groups
-        if self.is_ascend:
-            group_token_block_sizes = tuple(
-                self._ascend_group_token_block_size(group) for group in groups
-            )
-        else:
-            raw_group_token_block_sizes = tuple(
-                self.spec_token_block_size(group.kv_cache_spec) for group in groups
-            )
-            if not raw_group_token_block_sizes:
-                raise RuntimeError("FAWA connector found no KV cache groups.")
-            mutable_sizes = list(raw_group_token_block_sizes)
-            for group_id in self.fa_group_ids:
-                mutable_sizes[group_id] = self.hash_block_size
-            group_token_block_sizes = tuple(mutable_sizes)
-
-        for group_id, group_token_block_size in enumerate(group_token_block_sizes):
-            if group_token_block_size <= 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} block size must be positive, "
-                    f"got {group_token_block_size}."
-                )
-            if self.hash_block_size % group_token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} block size {group_token_block_size} "
-                    f"must divide {self.hash_block_size}."
-                )
-        return group_token_block_sizes
-
-    def _get_group_tensor_block_sizes(self) -> tuple[int, ...]:
-        tensor_block_sizes: list[int] = []
-        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            detected = {
-                tensor_block_size
-                for spec in self.group_specs(group)
-                if (tensor_block_size := self.spec_tensor_block_size(spec)) is not None
-            }
-            if len(detected) > 1:
-                raise RuntimeError(
-                    f"FAWA Ascend group {group_id} has mixed tensor "
-                    f"block sizes: {sorted(detected)}."
-                )
-            tensor_block_sizes.append(
-                detected.pop() if detected else self.group_token_block_sizes[group_id]
-            )
-        return tuple(tensor_block_sizes)
-
-    def _get_group_tensor_block_ratios(self) -> tuple[int, ...]:
-        ratios: list[int] = []
-        for group_id, (
-            group_token_block_size,
-            group_tensor_block_size,
-        ) in enumerate(zip(self.group_token_block_sizes, self.group_tensor_block_sizes)):
-            if group_tensor_block_size % group_token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} logical block size "
-                    f"{group_token_block_size} must divide tensor block size "
-                    f"{group_tensor_block_size}."
-                )
-            ratios.append(group_tensor_block_size // group_token_block_size)
-        return tuple(ratios)
-
     def _group_tensor_block_ratio(self, group_id: int) -> int:
         group = self.kv_cache_config.kv_cache_groups[group_id]
         token_block_size = self._ascend_group_token_block_size(group)
@@ -715,14 +652,21 @@ class UCMFAWAConnector(UCMDirectConnector):
             self.store = self._create_fa_store(None)
             self.fa_store = self.store
             self.wa_store = self._create_wa_store(None)
+        group_meta_summary = tuple(
+            {
+                "group_id": meta.group_id,
+                "token_block_size": meta.token_block_size,
+                "tensor_block_size": meta.tensor_block_size,
+                "tail_blocks": meta.tail_blocks,
+                "window_spans": meta.window_spans,
+            }
+            for _, meta in sorted(self.group_metas.items())
+        )
         logger.info(
             f"FAWA KV group config: fa_groups={self.fa_group_ids}, "
             f"window_groups={self.window_group_ids}, "
             f"ascend_layout={self._ascend_layout}, "
-            f"token_block_sizes={self.group_token_block_sizes}, "
-            f"group_tensor_block_sizes={self.group_tensor_block_sizes}, "
-            f"tail_blocks={self.group_tail_blocks}, "
-            f"window_spans={self.group_window_spans}"
+            f"group_metas={group_meta_summary}"
         )
         logger.info("Init UCM FAWA connector.")
 
@@ -766,23 +710,6 @@ class UCMFAWAConnector(UCMDirectConnector):
     def _spec_token_block_size(spec: object) -> int:
         return FAWABlockSpanLayout.spec_token_block_size(spec)
 
-    def _get_group_token_block_sizes(self) -> tuple[int, ...]:
-        raw_group_token_block_sizes = tuple(
-            self._spec_token_block_size(group.kv_cache_spec)
-            for group in self._kv_cache_config.kv_cache_groups
-        )
-        if not raw_group_token_block_sizes:
-            raise RuntimeError("FAWA connector found no KV cache groups.")
-        mutable_sizes = list(raw_group_token_block_sizes)
-        for group_id in self.fa_group_ids:
-            mutable_sizes[group_id] = self.hash_block_size
-        group_token_block_sizes = tuple(mutable_sizes)
-        self._validate_group_token_block_sizes(group_token_block_sizes)
-        return group_token_block_sizes
-
-    def _get_group_tensor_block_sizes(self) -> tuple[int, ...]:
-        return self.group_token_block_sizes
-
     def _validate_group_token_block_sizes(
         self, group_token_block_sizes: tuple[int, ...]
     ) -> None:
@@ -797,26 +724,6 @@ class UCMFAWAConnector(UCMDirectConnector):
                     f"FAWA group {group_id} block size {group_token_block_size} "
                     f"must divide {self.hash_block_size}."
                 )
-
-    def _get_group_tensor_block_ratios(self) -> tuple[int, ...]:
-        ratios: list[int] = []
-        for group_id, (
-            group_token_block_size,
-            group_tensor_block_size,
-        ) in enumerate(zip(self.group_token_block_sizes, self.group_tensor_block_sizes)):
-            if group_tensor_block_size % group_token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} logical block size "
-                    f"{group_token_block_size} must divide tensor block size "
-                    f"{group_tensor_block_size}."
-                )
-            ratios.append(group_tensor_block_size // group_token_block_size)
-        return tuple(ratios)
-
-    def _group_tensor_block_ratio(self, group_id: int) -> int:
-        return self.group_metas[group_id].tensor_block_size // self.group_metas[
-            group_id
-        ].token_block_size
 
     def _init_group_metas(self) -> None:
         groups = self._kv_cache_config.kv_cache_groups
@@ -1044,38 +951,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         if not window_group_ids:
             raise RuntimeError("FAWA connector found no window groups.")
         return fa_group_ids, window_group_ids
-
-    def _get_group_tail_blocks(self) -> tuple[Optional[int], ...]:
-        tail_blocks: list[Optional[int]] = [None] * len(self.group_token_block_sizes)
-        if self._kv_cache_config is None:
-            raise RuntimeError("FAWA connector requires kv_cache_config.")
-        for group_id in self.window_group_ids:
-            group_spec = self._kv_cache_config.kv_cache_groups[group_id]
-            group_token_block_size = self.group_token_block_sizes[group_id]
-            window_tokens = FAWABlockSpanLayout.group_window_tokens(group_spec)
-            if window_tokens is None:
-                tail_blocks[group_id] = self.hash_block_size // group_token_block_size
-                continue
-            if self._is_compressor_state_group(group_id):
-                tail_blocks[group_id] = self._compressor_state_tail_blocks(
-                    group_id,
-                    window_tokens,
-                    group_token_block_size,
-                )
-                continue
-            tail_blocks[group_id] = max(
-                1, math.ceil(window_tokens / group_token_block_size)
-            )
-        return tuple(tail_blocks)
-
-    def _get_group_window_spans(self) -> tuple[tuple[int, ...], ...]:
-        spans: list[tuple[int, ...]] = []
-        for group_id, tail_blocks in enumerate(self.group_tail_blocks):
-            if tail_blocks is None:
-                spans.append((self.group_token_block_sizes[group_id],))
-            else:
-                spans.append((self.group_token_block_sizes[group_id],) * tail_blocks)
-        return tuple(spans)
 
     @staticmethod
     def _is_compressor_state_name(layer_name: str) -> bool:
@@ -1677,7 +1552,9 @@ class UCMFAWAConnector(UCMDirectConnector):
                 continue
             meta = self.group_metas[group_id]
             candidates = candidate_vllm_ids[group_id]
-            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
+            token_blocks_per_tensor_block = (
+                meta.tensor_block_size // meta.token_block_size
+            )
             base_alloc_idx = (
                 hash_start * meta.logical_blocks_per_hash_block
             ) // token_blocks_per_tensor_block
@@ -1740,7 +1617,9 @@ class UCMFAWAConnector(UCMDirectConnector):
                 continue
 
             candidates = candidate_vllm_ids[group_id]
-            token_blocks_per_tensor_block = self._group_tensor_block_ratio(group_id)
+            token_blocks_per_tensor_block = (
+                meta.tensor_block_size // meta.token_block_size
+            )
             candidate_base = 0
             block_ids: list[int] = []
             offsets: list[int] = []

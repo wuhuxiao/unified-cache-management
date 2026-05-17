@@ -140,13 +140,11 @@ class CapturingStore:
         registry: "TensorRegistry",
         group_layouts: dict[int, KVCacheGroupLayout],
         group_ids: tuple[int, ...],
-        group_tensor_block_sizes: tuple[int, ...],
     ) -> None:
         self.store = store
         self.registry = registry
         self.group_layouts = group_layouts
         self.group_ids = group_ids
-        self.group_tensor_block_sizes = group_tensor_block_sizes
         self.dump_history: list[list[bytes]] = []
         self.load_history: list[list[bytes]] = []
         self.dump_rows: dict[bytes, bytes] = {}
@@ -502,15 +500,15 @@ def build_allocation(
     base_block_id: int,
 ) -> tuple[list[int], ...]:
     allocation: list[list[int]] = []
-    for group_id in range(len(connector.group_token_block_sizes)):
+    for group_id, meta in sorted(connector.group_metas.items()):
         max_tensor_idx = -1
         for canonical_idx in range(canonical_blocks):
             computed_end = (canonical_idx + 1) * connector.hash_block_size
             for group_block_idx in group_block_range(connector, group_id, computed_end):
                 tensor_idx = (
                     group_block_idx
-                    * connector.group_token_block_sizes[group_id]
-                    // connector.group_tensor_block_sizes[group_id]
+                    * meta.token_block_size
+                    // meta.tensor_block_size
                 )
                 max_tensor_idx = max(max_tensor_idx, tensor_idx)
         allocation.append([base_block_id + idx for idx in range(max_tensor_idx + 1)])
@@ -522,9 +520,10 @@ def group_block_range(
     group_id: int,
     computed_end_token: int,
 ) -> range:
-    group_token_block_size = connector.group_token_block_sizes[group_id]
+    meta = connector.group_metas[group_id]
+    group_token_block_size = meta.token_block_size
     end_block = math.ceil(computed_end_token / group_token_block_size)
-    tail_blocks = connector.group_tail_blocks[group_id]
+    tail_blocks = meta.tail_blocks
     if tail_blocks is None:
         start_token = max(0, computed_end_token - connector.hash_block_size)
         start_block = start_token // group_token_block_size
@@ -542,7 +541,7 @@ def dump_candidate_count(
     hash_end: int,
 ) -> int:
     meta = connector.group_metas[group_id]
-    token_blocks_per_tensor_block = connector._group_tensor_block_ratio(group_id)
+    token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
     if group_id in connector.window_group_ids:
         if not meta.tail_blocks:
             return 0
@@ -687,14 +686,12 @@ def wrap_store(
         registry,
         connector.group_layouts,
         connector.fa_group_ids,
-        connector.group_tensor_block_sizes,
     )
     connector.wa_store = CapturingStore(
         connector.wa_store,
         registry,
         connector.group_layouts,
         connector.window_group_ids,
-        connector.group_tensor_block_sizes,
     )
     connector.store = connector.fa_store
 
@@ -790,7 +787,7 @@ def test_gpu_tp4_deepseek_v4_flash_hma_e2e(tmp_path):
     assert producer_dispatch.dump_keys == prefix_keys
     assert producer_dispatch.dump_hash_end > producer_dispatch.dump_hash_start
     assert len(producer_dispatch.dump_vllm_block_ids) == len(
-        scheduler.group_token_block_sizes
+        scheduler.group_metas
     )
 
     seeded_fa_bytes: dict[bytes, bytes] = {}

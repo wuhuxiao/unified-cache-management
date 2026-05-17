@@ -148,7 +148,7 @@ def build_allocation(
     base_block_id: int,
 ) -> tuple[list[int], ...]:
     allocation: list[list[int]] = []
-    for group_id in range(len(connector.group_token_block_sizes)):
+    for group_id in sorted(connector.group_metas):
         max_tensor_idx = -1
         for canonical_idx in range(canonical_blocks):
             computed_end = (canonical_idx + 1) * connector.hash_block_size
@@ -167,9 +167,10 @@ def group_block_range(
     group_id: int,
     computed_end_token: int,
 ) -> range:
-    group_token_block_size = connector.group_token_block_sizes[group_id]
+    meta = connector.group_metas[group_id]
+    group_token_block_size = meta.token_block_size
     end_block = math.ceil(computed_end_token / group_token_block_size)
-    tail_blocks = connector.group_tail_blocks[group_id]
+    tail_blocks = meta.tail_blocks
     if tail_blocks is None:
         start_token = max(0, computed_end_token - connector.hash_block_size)
         start_block = start_token // group_token_block_size
@@ -187,7 +188,7 @@ def dump_candidate_count(
     hash_end: int,
 ) -> int:
     meta = connector.group_metas[group_id]
-    token_blocks_per_tensor_block = connector._group_tensor_block_ratio(group_id)
+    token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
     if group_id in connector.window_group_ids:
         if not meta.tail_blocks:
             return 0
@@ -548,13 +549,16 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
     req_a_meta = final_metadata.request_meta["req-a"]
     for group_id in scheduler.fa_group_ids:
         meta = scheduler.group_metas[group_id]
+        token_blocks_per_tensor_block = (
+            meta.tensor_block_size // meta.token_block_size
+        )
         expected = math.ceil(
             (req_a_meta.dump_hash_end * meta.logical_blocks_per_hash_block)
-            / scheduler._group_tensor_block_ratio(group_id)
+            / token_blocks_per_tensor_block
         ) - (
             req_a_meta.dump_hash_start
             * meta.logical_blocks_per_hash_block
-            // scheduler._group_tensor_block_ratio(group_id)
+            // token_blocks_per_tensor_block
         )
         assert len(req_a_meta.dump_vllm_block_ids[group_id]) == expected
     for group_id in scheduler.window_group_ids:
