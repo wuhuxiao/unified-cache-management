@@ -90,6 +90,36 @@ def test_group_meta_uses_integer_ratios_and_zero_tail():
     assert connector.group_metas[2].window_spans == ()
 
 
+def test_group_tuple_compatibility_properties_are_derived_from_metas():
+    connector = make_connector()
+    connector.group_metas = {
+        0: type(connector.group_metas[0])(
+            group_id=0,
+            token_block_size=256,
+            tensor_block_size=256,
+            logical_blocks_per_hash_block=1,
+            hash_blocks_per_tensor_block=1,
+            tail_blocks=None,
+            window_spans=(256,),
+        ),
+        1: type(connector.group_metas[1])(
+            group_id=1,
+            token_block_size=128,
+            tensor_block_size=512,
+            logical_blocks_per_hash_block=2,
+            hash_blocks_per_tensor_block=2,
+            tail_blocks=2,
+            window_spans=(128, 128),
+        ),
+    }
+
+    assert connector.group_token_block_sizes == (256, 128)
+    assert connector.group_tensor_block_sizes == (256, 512)
+    assert connector.group_tensor_block_ratios == (1, 4)
+    assert connector.group_tail_blocks == (None, 2)
+    assert connector.group_window_spans == ((256,), (128, 128))
+
+
 def test_dispatch_meta_accumulates_cached_blocks_and_slices_wa_tails():
     connector = make_connector()
     req_meta = FAWARequestMeta(
