@@ -364,9 +364,6 @@ class FAWABlockSpanLayout:
         self.fa_group_ids = fa_group_ids
         self.is_ascend = self._detect_ascend_layout()
         self.hash_block_size = self._get_hash_block_size()
-        self.group_token_block_sizes = self._get_group_token_block_sizes()
-        self.group_tensor_block_sizes = self._get_group_tensor_block_sizes()
-        self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
         self.group_layer_tensor_indices = self._get_group_layer_tensor_indices()
 
     @staticmethod
@@ -573,11 +570,26 @@ class FAWABlockSpanLayout:
         return tuple(ratios)
 
     def _group_tensor_block_ratio(self, group_id: int) -> int:
-        ratios = getattr(self, "group_tensor_block_ratios", None)
-        if ratios is None:
-            self.group_tensor_block_ratios = self._get_group_tensor_block_ratios()
-            ratios = self.group_tensor_block_ratios
-        return ratios[group_id]
+        group = self.kv_cache_config.kv_cache_groups[group_id]
+        token_block_size = self._ascend_group_token_block_size(group)
+        detected = {
+            tensor_block_size
+            for spec in self.group_specs(group)
+            if (tensor_block_size := self.spec_tensor_block_size(spec)) is not None
+        }
+        if len(detected) > 1:
+            raise RuntimeError(
+                f"FAWA Ascend group {group_id} has mixed tensor "
+                f"block sizes: {sorted(detected)}."
+            )
+        tensor_block_size = detected.pop() if detected else token_block_size
+        if tensor_block_size % token_block_size != 0:
+            raise RuntimeError(
+                f"FAWA group {group_id} logical block size "
+                f"{token_block_size} must divide tensor block size "
+                f"{tensor_block_size}."
+            )
+        return tensor_block_size // token_block_size
 
     @classmethod
     def spec_tensor_count(cls, spec: object) -> int:
@@ -1940,19 +1952,6 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
             raise RuntimeError("Ascend FAWA connector requires block span layout.")
         return self.block_span_layout.hash_block_size
 
-    def _get_group_token_block_sizes(self) -> tuple[int, ...]:
-        if self.block_span_layout is None:
-            raise RuntimeError("Ascend FAWA connector requires block span layout.")
-        self._ascend_layout = self.block_span_layout.is_ascend
-        group_token_block_sizes = self.block_span_layout.group_token_block_sizes
-        self._validate_group_token_block_sizes(group_token_block_sizes)
-        return group_token_block_sizes
-
-    def _get_group_tensor_block_sizes(self) -> tuple[int, ...]:
-        if self.block_span_layout is None:
-            raise RuntimeError("Ascend FAWA connector requires block span layout.")
-        return self.block_span_layout.group_tensor_block_sizes
-
     def _ascend_window_tail_tokens(self, group_id: int) -> Optional[int]:
         group_spec = self._kv_cache_config.kv_cache_groups[group_id]
         window_tokens = FAWABlockSpanLayout.group_window_tokens(group_spec)
@@ -1963,10 +1962,45 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
             return window_tokens
         return max(0, window_tokens - compress_ratio)
 
-    def _get_group_tail_blocks(self) -> tuple[Optional[int], ...]:
-        tail_blocks: list[Optional[int]] = [None] * len(self.group_token_block_sizes)
+    def _init_group_metas(self) -> None:
+        if self.block_span_layout is None:
+            raise RuntimeError("Ascend FAWA connector requires block span layout.")
+        self._ascend_layout = self.block_span_layout.is_ascend
+
+        groups = self._kv_cache_config.kv_cache_groups
+        if not groups:
+            raise RuntimeError("FAWA connector found no KV cache groups.")
+
+        token_block_sizes: list[int] = []
+        tensor_block_sizes: list[int] = []
+        for group_id, group in enumerate(groups):
+            token_block_size = self.block_span_layout._ascend_group_token_block_size(
+                group
+            )
+            detected = {
+                tensor_block_size
+                for spec in self.block_span_layout.group_specs(group)
+                if (
+                    tensor_block_size
+                    := self.block_span_layout.spec_tensor_block_size(spec)
+                )
+                is not None
+            }
+            if len(detected) > 1:
+                raise RuntimeError(
+                    f"FAWA Ascend group {group_id} has mixed tensor "
+                    f"block sizes: {sorted(detected)}."
+                )
+            tensor_block_size = detected.pop() if detected else token_block_size
+            token_block_sizes.append(token_block_size)
+            tensor_block_sizes.append(tensor_block_size)
+
+        self._validate_group_token_block_sizes(tuple(token_block_sizes))
+
+        tail_blocks: list[Optional[int]] = [None] * len(token_block_sizes)
+        window_spans: list[tuple[int, ...]] = [(size,) for size in token_block_sizes]
         for group_id in self.window_group_ids:
-            group_token_block_size = self.group_token_block_sizes[group_id]
+            group_token_block_size = token_block_sizes[group_id]
             window_tail_tokens = self._ascend_window_tail_tokens(group_id)
             if window_tail_tokens is None:
                 tail_blocks[group_id] = self.hash_block_size // group_token_block_size
@@ -1981,28 +2015,45 @@ class UCMAscendFAWAConnector(UCMFAWAConnector):
                 tail_blocks[group_id] = math.ceil(
                     window_tail_tokens / group_token_block_size
                 )
-        return tuple(tail_blocks)
 
-    def _get_group_window_spans(self) -> tuple[tuple[int, ...], ...]:
-        spans: list[tuple[int, ...]] = []
-        for group_id, tail_blocks in enumerate(self.group_tail_blocks):
-            if tail_blocks is None:
-                spans.append((self.group_token_block_sizes[group_id],))
-                continue
-            if tail_blocks == 0:
-                spans.append(())
+            if tail_blocks[group_id] == 0:
+                window_spans[group_id] = ()
                 continue
             window_tail_tokens = self._ascend_window_tail_tokens(group_id)
             if window_tail_tokens is None or self.block_span_layout.is_swa_group(
                 group_id
             ):
-                spans.append((self.group_token_block_sizes[group_id],) * tail_blocks)
+                window_spans[group_id] = (
+                    group_token_block_size,
+                ) * int(tail_blocks[group_id])
                 continue
-            group_token_block_size = self.group_token_block_sizes[group_id]
             group_spans: list[int] = []
             while window_tail_tokens > 0:
                 segment_tokens = min(group_token_block_size, window_tail_tokens)
                 group_spans.append(segment_tokens)
                 window_tail_tokens -= segment_tokens
-            spans.append(tuple(reversed(group_spans)))
-        return tuple(spans)
+            window_spans[group_id] = tuple(reversed(group_spans))
+
+        self.group_metas = {}
+        for group_id, token_block_size in enumerate(token_block_sizes):
+            tensor_block_size = tensor_block_sizes[group_id]
+            if tensor_block_size % token_block_size != 0:
+                raise RuntimeError(
+                    f"FAWA group {group_id} logical block size "
+                    f"{token_block_size} must divide tensor block size "
+                    f"{tensor_block_size}."
+                )
+            self.group_metas[group_id] = KVCacheGroupMeta(
+                group_id=group_id,
+                token_block_size=token_block_size,
+                tensor_block_size=tensor_block_size,
+                logical_blocks_per_hash_block=(
+                    self.hash_block_size // token_block_size
+                ),
+                hash_blocks_per_tensor_block=max(
+                    1,
+                    tensor_block_size // self.hash_block_size,
+                ),
+                tail_blocks=tail_blocks[group_id],
+                window_spans=window_spans[group_id],
+            )

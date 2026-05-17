@@ -257,15 +257,7 @@ def make_worker(
     worker.hash_block_size = scheduler.hash_block_size
     worker.fa_group_ids = scheduler.fa_group_ids
     worker.window_group_ids = scheduler.window_group_ids
-    worker.group_token_block_sizes = scheduler.group_token_block_sizes
-    worker.group_tensor_block_sizes = scheduler.group_tensor_block_sizes
-    worker.group_tensor_block_ratios = scheduler._get_group_tensor_block_ratios()
-    worker.group_tail_blocks = scheduler.group_tail_blocks
-    worker.group_window_spans = scheduler.group_window_spans
-    if not hasattr(scheduler, "group_metas"):
-        scheduler.group_tensor_block_ratios = scheduler._get_group_tensor_block_ratios()
-        scheduler._init_group_metas()
-    worker.group_metas = scheduler.group_metas
+    worker.group_metas = dict(scheduler.group_metas)
     worker.block_span_layout = scheduler.block_span_layout
     worker._ascend_layout = scheduler._ascend_layout
     worker.group_layouts = group_layouts
@@ -316,8 +308,6 @@ def bind_and_register(
 def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill():
     device = hbm_device()
     scheduler = make_ascend_connector()
-    scheduler.group_tensor_block_ratios = scheduler._get_group_tensor_block_ratios()
-    scheduler._init_group_metas()
     scheduler.persist_token_threshold = 0
     scheduler.generate_hash = generated_hashes
     scheduler._seed = b"seed"

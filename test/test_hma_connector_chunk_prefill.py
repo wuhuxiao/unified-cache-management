@@ -611,37 +611,7 @@ def make_ascend_connector() -> UCMAscendFAWAConnector:
     )
     connector._ascend_layout = connector.block_span_layout.is_ascend
     connector.hash_block_size = connector.block_span_layout.hash_block_size
-    set_group_metas(
-        connector,
-        token_block_sizes=connector.block_span_layout.group_token_block_sizes,
-        tensor_block_sizes=connector.block_span_layout.group_tensor_block_sizes,
-        tail_blocks=(
-            None,
-            1,
-            1,
-            None,
-            1,
-            1,
-            1,
-            1,
-            None,
-            0,
-            0,
-        ),
-        window_spans=(
-            (512,),
-            (128,),
-            (128,),
-            (512,),
-            (4,),
-            (4,),
-            (4,),
-            (4,),
-            (512,),
-            (),
-            (),
-        ),
-    )
+    connector._init_group_metas()
     connector.requests_meta = {}
     return connector
 
