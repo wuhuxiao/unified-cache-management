@@ -302,8 +302,8 @@ class UCMFAWAConnector(UCMDirectConnector):
         # current only support for DeepSeekV4
         DS_V4_REQUIRED_SPECS = frozenset({"SlidingWindowMLASpec"})
         gpu_support = DS_V4_REQUIRED_SPECS.issubset(spec_names)
-        
-        return gpu_support
+        npu_support = cls.can_handle_ascend_kv_cache_config(kv_cache_config)
+        return gpu_support or npu_support
 
     @classmethod
     def can_handle_ascend_kv_cache_config(
