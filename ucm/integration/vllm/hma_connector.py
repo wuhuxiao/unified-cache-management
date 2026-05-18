@@ -9,7 +9,6 @@ import torch
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
-    KVConnectorWorkerMetadata,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -34,11 +33,10 @@ logger = init_logger(__name__)
 class KVCacheGroupMeta:
     group_id: int
     token_block_size: int
-    tensor_block_size: int
-    logical_blocks_per_hash_block: int
-    hash_blocks_per_tensor_block: int
-    tail_blocks: int | None
-    window_spans: tuple[int, ...]
+    # compress_ratio is used for Ascend Setting, where 
+    compress_ratio: int
+    tail_blocks: int
+    tail_tokens: int
 
 
 class KVCacheGroupLayout:
@@ -53,13 +51,10 @@ class KVCacheGroupLayout:
         self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
         self.base_ptrs: np.ndarray
         self.block_strides: np.ndarray
-        self.token_strides: np.ndarray
-        self.tensor_size_lists: np.ndarray
-        self.tensor_size_per_token_lists: np.ndarray
-        self.view_tensor_block_sizes: np.ndarray
+        self.tensor_token_strides: np.ndarray
+        self.tensor_sizes_per_token: np.ndarray
+        self.tensor_block_sizes: np.ndarray
         self._build_layout()
-        self._tensor_tokens_cache: dict[tuple[int, int], np.ndarray] = {}
-        self._segment_tensor_size_cache: dict[tuple[int, int], tuple[int, ...]] = {}
 
     @staticmethod
     def _sort_key(item: tuple[str, torch.Tensor]) -> tuple[int, str]:
@@ -69,11 +64,9 @@ class KVCacheGroupLayout:
     def _build_layout(self) -> None:
         ptrs: list[int] = []
         strides: list[int] = []
-        token_strides: list[int] = []
-        tensor_sizes: list[int] = []
+        tensor_token_strides: list[int] = []
         tensor_sizes_per_token: list[int] = []
-        view_tensor_block_sizes: list[int] = []
-        view_tensors: list[torch.Tensor] = []
+        tensor_block_sizes: list[int] = []
         view_meta: list[tuple[str, tuple[int, ...], tuple[int, ...], str, int]] = []
 
         def handle_tensor(
@@ -84,24 +77,18 @@ class KVCacheGroupLayout:
             ptrs.append(t[0].data_ptr())
             strides.append(t.stride(0) * t.element_size())
             tensor_size = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
-            tensor_sizes.append(tensor_size)
             token_dim = 1
-            view_tensor_block_size = int(t.shape[token_dim])
-            if view_tensor_block_size <= 0:
-                raise ValueError(
-                    f"KV cache tensor has empty block dimension: {t.shape}"
-                )
-            token_strides.append(t.stride(token_dim) * t.element_size())
-            tensor_sizes_per_token.append(tensor_size // view_tensor_block_size)
-            view_tensor_block_sizes.append(view_tensor_block_size)
-            view_tensors.append(t)
+            tensor_block_size = int(t.shape[token_dim])
+            tensor_token_strides.append(t.stride(token_dim) * t.element_size())
+            tensor_sizes_per_token.append(tensor_size // tensor_block_size)
+            tensor_block_sizes.append(tensor_block_size)
             view_meta.append(
                 (
                     layer_name,
                     tuple(t.shape),
                     tuple(t.stride()),
                     str(t.dtype),
-                    view_tensor_block_size,
+                    tensor_block_size,
                 )
             )
 
@@ -146,429 +133,62 @@ class KVCacheGroupLayout:
 
         self.base_ptrs = np.asarray(ptrs, dtype=np.uint64)
         self.block_strides = np.asarray(strides, dtype=np.uint64)
-        self.token_strides = np.asarray(token_strides, dtype=np.uint64)
-        self.tensor_size_lists = np.asarray(tensor_sizes, dtype=np.uint64)
-        self.tensor_size_per_token_lists = np.asarray(
+        self.tensor_token_strides = np.asarray(tensor_token_strides, dtype=np.uint64)
+        self.tensor_sizes_per_token = np.asarray(
             tensor_sizes_per_token, dtype=np.uint64
         )
-        self.view_tensor_block_sizes = np.asarray(
-            view_tensor_block_sizes, dtype=np.uint64
+        self.tensor_block_sizes = np.asarray(
+            tensor_block_sizes, dtype=np.uint64
         )
-        self.view_tensors = view_tensors
         self.view_meta = [
             {
                 "name": name,
                 "shape": shape,
                 "stride": stride,
                 "dtype": dtype,
-                "view_tensor_block_size": view_tensor_block_size,
+                "tensor_block_size": tensor_block_size,
             }
-            for name, shape, stride, dtype, view_tensor_block_size in view_meta
+            for name, shape, stride, dtype, tensor_block_size in view_meta
         ]
         logger.info(
             f"KV cache group layout: views={len(self.kvcaches)}, "
-            f"ptrs={len(ptrs)}, tensor_block_bytes={self.tensor_block_bytes}, "
-            f"view_tensor_block_sizes={sorted(set(view_tensor_block_sizes))}"
+            f"ptrs={len(ptrs)}, "
+            f"tensor_block_sizes={sorted(set(tensor_block_sizes))}"
         )
-
-    def extract_block_addrs(self, vllm_block_ids: list[int]) -> np.ndarray:
-        vllm_block_ids_np = np.array(vllm_block_ids, np.uint64)
-        return (
-            vllm_block_ids_np[:, None] * self.block_strides[None, :]
-            + self.base_ptrs[None, :]
-        )
-
-    def _logical_to_tensor_tokens(
-        self,
-        logical_tokens: int,
-        group_tensor_block_size: int,
-        view_tensor_block_size: int,
-    ) -> int:
-        scaled = logical_tokens * view_tensor_block_size
-        if scaled % group_tensor_block_size != 0:
-            raise ValueError(
-                f"Logical segment of {logical_tokens} tokens does not align with "
-                f"view tensor block size={view_tensor_block_size} and group "
-                f"tensor block size={group_tensor_block_size}."
-            )
-        return scaled // group_tensor_block_size
-
-    def _tensor_tokens_for_logical(
-        self,
-        logical_tokens: int,
-        group_tensor_block_size: int,
-    ) -> np.ndarray:
-        key = (group_tensor_block_size, logical_tokens)
-        cached = self._tensor_tokens_cache.get(key)
-        if cached is not None:
-            return cached
-
-        scaled = self.view_tensor_block_sizes * np.uint64(logical_tokens)
-        misaligned = scaled % np.uint64(group_tensor_block_size)
-        if np.any(misaligned):
-            raise ValueError(
-                f"Logical segment of {logical_tokens} tokens does not align with "
-                f"view tensor block sizes={self.view_tensor_block_sizes.tolist()} "
-                f"and group tensor block size={group_tensor_block_size}."
-            )
-        tensor_tokens = scaled // np.uint64(group_tensor_block_size)
-        self._tensor_tokens_cache[key] = tensor_tokens
-        return tensor_tokens
-
-    def _tensor_tokens_for_logical_batch(
-        self,
-        logical_offsets: np.ndarray,
-        group_tensor_block_size: int,
-    ) -> np.ndarray:
-        signed_offsets = np.asarray(logical_offsets, dtype=np.int64)
-        if signed_offsets.ndim != 1:
-            raise ValueError(
-                "KV cache logical offsets for batch address extraction must be 1-D."
-            )
-        if np.any(signed_offsets < 0):
-            raise ValueError("Negative KV cache logical offset is invalid.")
-        offsets_np = signed_offsets.astype(np.uint64, copy=False)
-        scaled = offsets_np[:, None] * self.view_tensor_block_sizes[None, :]
-        group_size = np.uint64(group_tensor_block_size)
-        misaligned = scaled % group_size
-        if np.any(misaligned):
-            raise ValueError(
-                f"Logical offsets {offsets_np.tolist()} do not align with "
-                f"view tensor block sizes={self.view_tensor_block_sizes.tolist()} "
-                f"and group tensor block size={group_tensor_block_size}."
-            )
-        return scaled // group_size
 
     def extract_segment_addrs_batch(
         self,
         block_ids: np.ndarray,
         offsets: np.ndarray,
-        group_tensor_block_size: int,
+        group_token_block_size: int,
     ) -> np.ndarray:
-        signed_block_ids = np.asarray(block_ids, dtype=np.int64)
-        signed_offsets = np.asarray(offsets, dtype=np.int64)
-        if signed_block_ids.ndim != 1:
-            raise ValueError(
-                "KV cache block ids for batch address extraction must be 1-D."
-            )
-        if signed_offsets.ndim != 1:
-            raise ValueError(
-                "KV cache logical offsets for batch address extraction must be 1-D."
-            )
-        if len(signed_block_ids) != len(signed_offsets):
-            raise ValueError(
-                "KV cache block ids and logical offsets must have the same length."
-            )
-        if signed_block_ids.size == 0:
-            return np.empty((0, len(self.base_ptrs)), dtype=np.uint64)
-        if np.any(signed_block_ids < 0):
-            raise ValueError("Negative KV cache block id needs a scratch target.")
-        if np.any(signed_offsets < 0):
-            raise ValueError("Negative KV cache logical offset is invalid.")
-        block_ids_np = signed_block_ids.astype(np.uint64, copy=False)
-        tensor_offsets = self._tensor_tokens_for_logical_batch(
-            signed_offsets,
-            group_tensor_block_size,
-        )
+        
+        physical_token_offsets = offsets[:, None] * self.tensor_block_sizes[None, :] // group_token_block_size
+       
         return (
-            block_ids_np[:, None] * self.block_strides[None, :]
-            + tensor_offsets * self.token_strides[None, :]
+            block_ids[:, None] * self.block_strides[None, :]
+            + physical_token_offsets * self.tensor_token_strides[None, :]
             + self.base_ptrs[None, :]
         ).astype(np.uint64, copy=False)
 
     def segment_tensor_size_list(
         self,
         logical_tokens: int,
-        group_tensor_block_size: int,
+        group_token_block_size: int,
     ) -> list[int]:
-        key = (group_tensor_block_size, logical_tokens)
-        cached = self._segment_tensor_size_cache.get(key)
-        if cached is None:
-            tensor_tokens = self._tensor_tokens_for_logical(
-                logical_tokens,
-                group_tensor_block_size,
-            )
-            cached = tuple(
-                int(size)
-                for size in (
-                    self.tensor_size_per_token_lists * tensor_tokens
-                ).tolist()
-            )
-            self._segment_tensor_size_cache[key] = cached
-        return list(cached)
+        
+        tensor_tokens = self.tensor_block_sizes * logical_tokens // group_token_block_size
+        return (self.tensor_sizes_per_token * tensor_tokens).tolist()
 
-    def extract_block_tensor_views(
-        self, vllm_block_ids: list[int]
-    ) -> list[torch.Tensor]:
-        tensors: list[torch.Tensor] = []
-
-        for block_id in vllm_block_ids:
-            for tensor in self.view_tensors:
-                tensors.append(tensor[block_id])
-        return tensors
-
-    @property
-    def tensor_size_list(self) -> list[int]:
-        return self.tensor_size_lists.tolist()
-
-    @property
-    def shard_size(self) -> int:
-        return int(self.tensor_size_lists.sum())
-
-    @property
-    def tensor_block_bytes(self) -> int:
-        return self.shard_size
 
     @property
     def tensor_block_size(self) -> int:
-        if len(set(self.view_tensor_block_sizes.tolist())) != 1:
+        if len(set(self.tensor_block_sizes.tolist())) != 1:
             raise ValueError(
                 "KV cache group layout has mixed view tensor block sizes: "
-                f"{self.view_tensor_block_sizes.tolist()}"
+                f"{self.tensor_block_sizes.tolist()}"
             )
-        return int(self.view_tensor_block_sizes[0])
-
-class FAWABlockSpanLayout:
-    """Maps FAWA canonical hash blocks to per-group KV cache spans."""
-
-    ASCEND_HASH_BLOCK_SIZE = 512
-    ASCEND_REQUIRED_SPECS = frozenset(
-        {"Compress4AttentionSpec", "C4IndexerSpec", "Compress128AttentionSpec"}
-    )
-    ASCEND_TENSOR_BLOCK_SPECS = {
-        "Compress4AttentionSpec": 512,
-        "C4IndexerSpec": 4096,
-        "Compress128AttentionSpec": 16384,
-    }
-    ASCEND_MULTI_TENSOR_SPECS = {
-        # vllm-ascend _reshape_kv_cache_tensors() extends C4 indexer as
-        # [indexer_kv_cache, indexer_scale_cache]. Other DSV4 specs append one
-        # tensor each in kv-cache-group order.
-        "C4IndexerSpec": 2,
-    }
-    ASCEND_STATE_COMPRESS_RATIOS = {
-        "C4AttnKVStateSpec": 4,
-        "C4AttnScoreStateSpec": 4,
-        "C4IndexerKVStateSpec": 4,
-        "C4IndexerScoreStateSpec": 4,
-        "C128AttnKVStateSpec": 128,
-        "C128AttnScoreStateSpec": 128,
-    }
-
-    def __init__(
-        self,
-        kv_cache_config: "KVCacheConfig",
-        fa_group_ids: tuple[int, ...],
-    ) -> None:
-        self.kv_cache_config = kv_cache_config
-        self.fa_group_ids = fa_group_ids
-        self.is_ascend = self._detect_ascend_layout()
-        self.hash_block_size = self._get_hash_block_size()
-        self.group_layer_tensor_indices = self._get_group_layer_tensor_indices()
-
-    @staticmethod
-    def group_specs(group_spec) -> tuple[object, ...]:
-        nested_specs = getattr(group_spec.kv_cache_spec, "kv_cache_specs", None)
-        return (
-            tuple(nested_specs.values())
-            if nested_specs
-            else (group_spec.kv_cache_spec,)
-        )
-
-    @staticmethod
-    def group_layer_specs(group_spec, layer_name: str) -> tuple[object, ...]:
-        nested_specs = getattr(group_spec.kv_cache_spec, "kv_cache_specs", None)
-        if nested_specs:
-            return (nested_specs[layer_name],)
-        return (group_spec.kv_cache_spec,)
-
-    @staticmethod
-    def group_spec_items(group_spec) -> tuple[tuple[str, object], ...]:
-        nested_specs = getattr(group_spec.kv_cache_spec, "kv_cache_specs", None)
-        if nested_specs:
-            return tuple(nested_specs.items())
-        return tuple(
-            (layer_name, group_spec.kv_cache_spec)
-            for layer_name in group_spec.layer_names
-        )
-
-    @staticmethod
-    def spec_window_tokens(spec: object) -> Optional[int]:
-        window_size = getattr(spec, "sliding_window", None) or getattr(
-            spec, "attention_chunk_size", None
-        )
-        return int(window_size) if window_size is not None else None
-
-    @classmethod
-    def group_window_tokens(cls, group_spec) -> Optional[int]:
-        window_sizes = {
-            window_tokens
-            for spec in cls.group_specs(group_spec)
-            if (window_tokens := cls.spec_window_tokens(spec)) is not None
-        }
-        if not window_sizes:
-            return None
-        if len(window_sizes) != 1:
-            raise RuntimeError(
-                "FAWA KV cache group has mixed window sizes: " f"{sorted(window_sizes)}"
-            )
-        return window_sizes.pop()
-
-    @classmethod
-    def group_has_window(cls, group_spec) -> bool:
-        return cls.group_window_tokens(group_spec) is not None
-
-    @classmethod
-    def is_ascend_kv_cache_config(
-        cls, kv_cache_config: Optional["KVCacheConfig"]
-    ) -> bool:
-        if kv_cache_config is None:
-            return False
-        groups = kv_cache_config.kv_cache_groups
-        if not any(type(group).__name__.startswith("Ascend") for group in groups):
-            return False
-        spec_names = {
-            type(spec).__name__ for group in groups for spec in cls.group_specs(group)
-        }
-        return cls.ASCEND_REQUIRED_SPECS.issubset(spec_names)
-
-    @staticmethod
-    def spec_token_block_size(spec: object) -> int:
-        block_size = getattr(spec, "block_size", None)
-        if block_size is None:
-            raise RuntimeError(
-                f"FAWA KV cache spec {type(spec).__name__} has no block_size."
-            )
-        return int(block_size)
-
-    @classmethod
-    def spec_tensor_block_size(cls, spec: object) -> Optional[int]:
-        spec_name = type(spec).__name__
-        fixed_size = cls.ASCEND_TENSOR_BLOCK_SPECS.get(spec_name)
-        if fixed_size is not None:
-            return fixed_size
-        compress_ratio = int(getattr(spec, "compress_ratio", 1))
-        if compress_ratio <= 1:
-            return None
-        return cls.spec_token_block_size(spec) * compress_ratio
-
-    def _detect_ascend_layout(self) -> bool:
-        return self.is_ascend_kv_cache_config(self.kv_cache_config)
-
-    def state_compress_ratio(self, group_id: int) -> Optional[int]:
-        ratios = set()
-        group = self.kv_cache_config.kv_cache_groups[group_id]
-        for spec in self.group_specs(group):
-            spec_name = type(spec).__name__
-            ratio = getattr(spec, "compress_ratio", None)
-            if ratio is None:
-                ratio = self.ASCEND_STATE_COMPRESS_RATIOS.get(spec_name)
-            if ratio is not None and int(ratio) > 1:
-                ratios.add(int(ratio))
-        if len(ratios) > 1:
-            raise RuntimeError(
-                f"FAWA Ascend group {group_id} has mixed compress ratios: "
-                f"{sorted(ratios)}."
-            )
-        return ratios.pop() if ratios else None
-
-    def is_swa_group(self, group_id: int) -> bool:
-        group = self.kv_cache_config.kv_cache_groups[group_id]
-        return any(
-            type(spec).__name__ == "SWAAttentionSpec"
-            for spec in self.group_specs(group)
-        )
-
-    def _get_hash_block_size(self) -> int:
-        if self.is_ascend:
-            return self.ASCEND_HASH_BLOCK_SIZE
-        fa_block_sizes = {
-            self.spec_token_block_size(
-                self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-            )
-            for group_id in self.fa_group_ids
-        }
-        if len(fa_block_sizes) != 1:
-            raise RuntimeError(
-                "FAWA connector requires one FA token block size, got "
-                f"{sorted(fa_block_sizes)}."
-            )
-        return fa_block_sizes.pop()
-
-    def _ascend_group_token_block_size(self, group_spec) -> int:
-        # Ascend DeepSeek V4 stores selected compressed groups at a 512-token
-        # canonical segment inside larger tensor pages. Other groups keep the
-        # token block size advertised by the KV cache spec.
-        if any(
-            self.spec_tensor_block_size(spec) is not None
-            for spec in self.group_specs(group_spec)
-        ):
-            return self.hash_block_size
-        return self.spec_token_block_size(group_spec.kv_cache_spec)
-
-    def _group_tensor_block_ratio(self, group_id: int) -> int:
-        group = self.kv_cache_config.kv_cache_groups[group_id]
-        token_block_size = self._ascend_group_token_block_size(group)
-        detected = {
-            tensor_block_size
-            for spec in self.group_specs(group)
-            if (tensor_block_size := self.spec_tensor_block_size(spec)) is not None
-        }
-        if len(detected) > 1:
-            raise RuntimeError(
-                f"FAWA Ascend group {group_id} has mixed tensor "
-                f"block sizes: {sorted(detected)}."
-            )
-        tensor_block_size = detected.pop() if detected else token_block_size
-        if tensor_block_size % token_block_size != 0:
-            raise RuntimeError(
-                f"FAWA group {group_id} logical block size "
-                f"{token_block_size} must divide tensor block size "
-                f"{tensor_block_size}."
-            )
-        return tensor_block_size // token_block_size
-
-    @classmethod
-    def spec_tensor_count(cls, spec: object) -> int:
-        return cls.ASCEND_MULTI_TENSOR_SPECS.get(type(spec).__name__, 1)
-
-    def _get_group_layer_tensor_indices(
-        self,
-    ) -> dict[int, dict[str, tuple[int, ...]]]:
-        if not self.is_ascend:
-            return {}
-
-        mapping: dict[int, dict[str, tuple[int, ...]]] = {}
-        next_tensor_index_by_layer: dict[str, int] = {}
-        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-            group_mapping: dict[str, tuple[int, ...]] = {}
-            for layer_name in group.layer_names:
-                tensor_count = sum(
-                    self.spec_tensor_count(spec)
-                    for spec in self.group_layer_specs(group, layer_name)
-                )
-                start = next_tensor_index_by_layer.get(layer_name, 0)
-                end = start + tensor_count
-                group_mapping[layer_name] = tuple(range(start, end))
-                next_tensor_index_by_layer[layer_name] = end
-            mapping[group_id] = group_mapping
-        return mapping
-
-    def group_tensor_indices(
-        self, group_id: int, layer_name: str
-    ) -> Optional[tuple[int, ...]]:
-        if not self.is_ascend:
-            return None
-        try:
-            return self.group_layer_tensor_indices[group_id][layer_name]
-        except KeyError as exc:
-            raise RuntimeError(
-                f"FAWA Ascend layout has no tensor index mapping for "
-                f"group {group_id}, layer {layer_name}."
-            ) from exc
-
-    def allocation_index(self, group_id: int, group_block_idx: int) -> int:
-        return group_block_idx // self._group_tensor_block_ratio(group_id)
+        return int(self.tensor_block_sizes[0])
 
 @dataclass
 class FAWARequestMeta:
@@ -637,13 +257,12 @@ class UCMFAWAConnector(UCMDirectConnector):
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
-        self.fa_group_ids, self.window_group_ids = self._partition_kv_cache_groups()
         if self._kv_cache_config is None:
             raise RuntimeError("FAWA connector requires kv_cache_config.")
-        self.block_span_layout = self._create_block_span_layout()
-        self._ascend_layout = False
-        self.hash_block_size = self._get_hash_block_size()
-        self.block_size = self.hash_block_size
+
+        self.is_ascend_layout = False
+        self.fa_group_ids, self.window_group_ids = [], []
+        self.group_metas: dict[int, KVCacheGroupMeta] = {}
         self._init_group_metas()
         self.fa_store: Optional[UcmKVStoreBaseV1] = None
         self.wa_store: Optional[UcmKVStoreBaseV1] = None
@@ -656,16 +275,16 @@ class UCMFAWAConnector(UCMDirectConnector):
             {
                 "group_id": meta.group_id,
                 "token_block_size": meta.token_block_size,
-                "tensor_block_size": meta.tensor_block_size,
+                "compress_ratio": meta.compress_ratio,
                 "tail_blocks": meta.tail_blocks,
-                "window_spans": meta.window_spans,
+                "window_spans": meta.tail_tokens,
             }
             for _, meta in sorted(self.group_metas.items())
         )
         logger.info(
             f"FAWA KV group config: fa_groups={self.fa_group_ids}, "
             f"window_groups={self.window_group_ids}, "
-            f"ascend_layout={self._ascend_layout}, "
+            f"is_ascend_layout={self.is_ascend_layout}, "
             f"group_metas={group_meta_summary}"
         )
         logger.info("Init UCM FAWA connector.")
@@ -676,139 +295,71 @@ class UCMFAWAConnector(UCMDirectConnector):
     ) -> bool:
         if kv_cache_config is None:
             return False
-        if cls.can_handle_ascend_kv_cache_config(kv_cache_config):
-            return False
-        fa_groups, window_groups = cls._partition_group_specs(
-            kv_cache_config.kv_cache_groups
-        )
-        return bool(fa_groups and window_groups)
+        
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+        spec_names = {
+            type(spec).__name__ for group in kv_cache_groups for spec in group.kv_cache_spec
+        }
+        # current only support for DeepSeekV4
+        DS_V4_REQUIRED_SPECS = frozenset({"SlidingWindowMLASpec"})
+        gpu_support = DS_V4_REQUIRED_SPECS.issubset(spec_names)
+        
+        return gpu_support
 
     @classmethod
     def can_handle_ascend_kv_cache_config(
         cls, kv_cache_config: Optional["KVCacheConfig"]
     ) -> bool:
-        return FAWABlockSpanLayout.is_ascend_kv_cache_config(kv_cache_config)
-
-    def _create_block_span_layout(self) -> Optional[FAWABlockSpanLayout]:
-        return None
-
-    def _get_hash_block_size(self) -> int:
-        fa_block_sizes = {
-            self._spec_token_block_size(
-                self._kv_cache_config.kv_cache_groups[group_id].kv_cache_spec
-            )
-            for group_id in self.fa_group_ids
+        if kv_cache_config is None:
+            return False
+        kv_cache_groups = kv_cache_config.kv_cache_groups
+        spec_names = {
+            type(spec).__name__ for group in kv_cache_groups for spec in group.kv_cache_spec
         }
-        if len(fa_block_sizes) != 1:
-            raise RuntimeError(
-                "FAWA connector requires one FA token block size, got "
-                f"{sorted(fa_block_sizes)}."
-            )
-        return fa_block_sizes.pop()
-
-    @staticmethod
-    def _spec_token_block_size(spec: object) -> int:
-        return FAWABlockSpanLayout.spec_token_block_size(spec)
-
-    def _validate_group_token_block_sizes(
-        self, group_token_block_sizes: tuple[int, ...]
-    ) -> None:
-        for group_id, group_token_block_size in enumerate(group_token_block_sizes):
-            if group_token_block_size <= 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} block size must be positive, "
-                    f"got {group_token_block_size}."
-                )
-            if self.hash_block_size % group_token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} block size {group_token_block_size} "
-                    f"must divide {self.hash_block_size}."
-                )
-
+        ASCEND_REQUIRED_SPECS = frozenset(
+            {"Compress4AttentionSpec", "C4IndexerSpec", "Compress128AttentionSpec"}
+        )
+        npu_support = type(kv_cache_groups).__name__.startswith("Ascend") and ASCEND_REQUIRED_SPECS.issubset(spec_names)
+        return npu_support
+    
     def _init_group_metas(self) -> None:
+        if self.can_handle_ascend_kv_cache_config(self._kv_cache_config):
+            self.is_ascend_layout = True
+            
         groups = self._kv_cache_config.kv_cache_groups
-        if not groups:
-            raise RuntimeError("FAWA connector found no KV cache groups.")
-
-        token_block_sizes: list[int] = []
+        self.fa_group_ids, self.window_group_ids = [], []
         for group_id, group in enumerate(groups):
-            token_block_size = self._spec_token_block_size(group.kv_cache_spec)
-            if group_id in self.fa_group_ids:
-                token_block_size = self.hash_block_size
-            token_block_sizes.append(token_block_size)
+            kv_cache_spec = group.kv_cache_spec
+            # handle attention window cache
+            window_size = getattr(kv_cache_spec, "sliding_window", None)
+            compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+            token_block_size = kv_cache_spec.block_size
 
-        self._validate_group_token_block_sizes(tuple(token_block_sizes))
-
-        tensor_block_sizes = list(token_block_sizes)
-        tail_blocks: list[Optional[int]] = [None] * len(token_block_sizes)
-        window_spans = [(size,) for size in token_block_sizes]
-
-        for group_id in self.window_group_ids:
-            group_spec = groups[group_id]
-            token_block_size = token_block_sizes[group_id]
-            window_tokens = FAWABlockSpanLayout.group_window_tokens(group_spec)
-            if window_tokens is None:
-                tail_blocks[group_id] = self.hash_block_size // token_block_size
-            elif self._is_compressor_state_group(group_id):
-                tail_blocks[group_id] = self._compressor_state_tail_blocks(
-                    group_id,
-                    window_tokens,
-                    token_block_size,
-                )
+            if self.is_ascend_layout:
+                # for ascend bug, wait for ascend fix
+                token_block_size = kv_cache_spec.block_size * compress_ratio
+    
+            if window_size is None:
+                # hash_block_size must be an integral multiple of token_block_size.
+                tail_tokens = self.hash_block_size
+                self.fa_group_ids.append(group_id)
             else:
-                tail_blocks[group_id] = max(1, math.ceil(window_tokens / token_block_size))
-            window_spans[group_id] = (token_block_size,) * int(tail_blocks[group_id])
-
-        self.group_metas = {}
-        for group_id, token_block_size in enumerate(token_block_sizes):
-            tensor_block_size = tensor_block_sizes[group_id]
-            if tensor_block_size % token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} logical block size "
-                    f"{token_block_size} must divide tensor block size "
-                    f"{tensor_block_size}."
-                )
+                tail_tokens = window_size
+                if compress_ratio > 1:
+                # for DeepSeekV4 C4A/C4A Indexer state cache
+                    tail_tokens = window_size - compress_ratio
+                tail_blocks = tail_tokens // token_block_size
+                self.window_group_ids.append(group_id)
+           
+            tail_blocks = max(tail_tokens // token_block_size, 1)
             self.group_metas[group_id] = KVCacheGroupMeta(
                 group_id=group_id,
                 token_block_size=token_block_size,
-                tensor_block_size=tensor_block_size,
-                logical_blocks_per_hash_block=(
-                    self.hash_block_size // token_block_size
-                ),
-                hash_blocks_per_tensor_block=max(
-                    1,
-                    tensor_block_size // self.hash_block_size,
-                ),
-                tail_blocks=tail_blocks[group_id],
-                window_spans=tuple(window_spans[group_id]),
+                compress_ratio=compress_ratio,
+                tail_blocks=tail_blocks,
+                tail_tokens=tail_tokens
             )
-
-    @property
-    def group_token_block_sizes(self) -> tuple[int, ...]:
-        return tuple(
-            meta.token_block_size for _, meta in sorted(self.group_metas.items())
-        )
-
-    @property
-    def group_tensor_block_sizes(self) -> tuple[int, ...]:
-        return tuple(
-            meta.tensor_block_size for _, meta in sorted(self.group_metas.items())
-        )
-
-    @property
-    def group_tensor_block_ratios(self) -> tuple[int, ...]:
-        return tuple(
-            meta.tensor_block_size // meta.token_block_size
-            for _, meta in sorted(self.group_metas.items())
-        )
-
-    @property
-    def group_tail_blocks(self) -> tuple[int | None, ...]:
-        return tuple(meta.tail_blocks for _, meta in sorted(self.group_metas.items()))
-
-    @property
-    def group_window_spans(self) -> tuple[tuple[int, ...], ...]:
-        return tuple(meta.window_spans for _, meta in sorted(self.group_metas.items()))
+        
 
     def _create_fa_store(
         self,
@@ -929,136 +480,10 @@ class UCMFAWAConnector(UCMDirectConnector):
             summary["tensor_bytes"] = sum(tensor_sizes)
         return summary
 
-    @staticmethod
-    def _partition_group_specs(
-        group_specs,
-    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        fa_group_ids: list[int] = []
-        window_group_ids: list[int] = []
-        for group_id, group_spec in enumerate(group_specs):
-            if FAWABlockSpanLayout.group_has_window(group_spec):
-                window_group_ids.append(group_id)
-            else:
-                fa_group_ids.append(group_id)
-        return tuple(fa_group_ids), tuple(window_group_ids)
-
-    def _partition_kv_cache_groups(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        fa_group_ids, window_group_ids = self._partition_group_specs(
-            self._kv_cache_config.kv_cache_groups
-        )
-        if not fa_group_ids:
-            raise RuntimeError("FAWA connector found no full-attention groups.")
-        if not window_group_ids:
-            raise RuntimeError("FAWA connector found no window groups.")
-        return fa_group_ids, window_group_ids
-
-    @staticmethod
-    def _is_compressor_state_name(layer_name: str) -> bool:
-        return ".compressor.state_cache" in layer_name
-
-    @staticmethod
-    def _compressor_state_prefix(layer_name: str) -> str:
-        suffix = ".compressor.state_cache"
-        if layer_name.endswith(suffix):
-            return layer_name[: -len(suffix)]
-        return layer_name.split(suffix, 1)[0]
-
-    def _is_compressor_state_group(self, group_id: int) -> bool:
-        if self._kv_cache_config is None:
-            raise RuntimeError("FAWA connector requires kv_cache_config.")
-        group_spec = self._kv_cache_config.kv_cache_groups[group_id]
-        layer_names = tuple(group_spec.layer_names)
-        return bool(layer_names) and all(
-            self._is_compressor_state_name(name) for name in layer_names
-        )
-
-    def _group_compress_ratio(self, group_id: int) -> Optional[int]:
-        if self._kv_cache_config is None:
-            raise RuntimeError("FAWA connector requires kv_cache_config.")
-        group_spec = self._kv_cache_config.kv_cache_groups[group_id]
-        ratios = {
-            int(ratio)
-            for spec in FAWABlockSpanLayout.group_specs(group_spec)
-            if (ratio := getattr(spec, "compress_ratio", 1)) and int(ratio) > 1
-        }
-        if len(ratios) > 1:
-            raise RuntimeError(
-                f"FAWA KV cache group {group_id} has mixed compress ratios: "
-                f"{sorted(ratios)}"
-            )
-        if ratios:
-            return ratios.pop()
-
-        if not self._is_compressor_state_group(group_id):
-            return None
-
-        config_ratios = getattr(
-            self._vllm_config.model_config.hf_config,
-            "compress_ratios",
-            None,
-        )
-        if config_ratios:
-            for layer_name in group_spec.layer_names:
-                layer_index = extract_layer_index(layer_name)
-                if layer_index < len(config_ratios):
-                    ratio = int(config_ratios[layer_index])
-                    if ratio > 1:
-                        ratios.add(ratio)
-            if len(ratios) > 1:
-                raise RuntimeError(
-                    f"FAWA compressor state group {group_id} maps to mixed "
-                    f"model config compress ratios: {sorted(ratios)}"
-                )
-            if ratios:
-                return ratios.pop()
-
-        prefixes = tuple(
-            self._compressor_state_prefix(layer_name)
-            for layer_name in group_spec.layer_names
-        )
-        for other_group in self._kv_cache_config.kv_cache_groups:
-            for layer_name, spec in FAWABlockSpanLayout.group_spec_items(other_group):
-                ratio = getattr(spec, "compress_ratio", 1)
-                if not ratio or int(ratio) <= 1:
-                    continue
-                if any(
-                    layer_name == prefix or layer_name.startswith(prefix + ".")
-                    for prefix in prefixes
-                ):
-                    ratios.add(int(ratio))
-
-        if len(ratios) > 1:
-            raise RuntimeError(
-                f"FAWA compressor state group {group_id} maps to mixed "
-                f"compress ratios: {sorted(ratios)}"
-            )
-        return ratios.pop() if ratios else None
-
-    def _compressor_state_tail_blocks(
-        self,
-        group_id: int,
-        window_tokens: int,
-        group_token_block_size: int,
-    ) -> int:
-        compress_ratio = self._group_compress_ratio(group_id)
-        if compress_ratio is None:
-            return max(1, math.ceil(window_tokens / group_token_block_size))
-        if compress_ratio <= 0:
-            raise RuntimeError(
-                f"FAWA group {group_id} compress ratio must be positive, "
-                f"got {compress_ratio}."
-            )
-        if window_tokens <= compress_ratio:
-            return 0
-        return math.ceil((window_tokens - compress_ratio) / group_token_block_size)
-
     def _split_kv_caches_by_vllm_groups(
         self, kv_caches: dict[str, torch.Tensor]
     ) -> dict[int, dict[str, torch.Tensor]]:
-        if self._kv_cache_config is None:
-            raise RuntimeError("FAWA connector requires kv_cache_config.")
         groups: dict[int, dict[str, torch.Tensor]] = {}
-        used_names: set[str] = set()
         for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
             group_caches: dict[str, torch.Tensor] = {}
             for name in group_spec.layer_names:
@@ -1070,39 +495,9 @@ class UCMFAWAConnector(UCMDirectConnector):
                     if self.block_span_layout is not None
                     else None
                 )
-                if tensor_indices is None:
-                    group_caches[name] = kv_cache
-                else:
-                    if not isinstance(kv_cache, (list, tuple)):
-                        raise TypeError(
-                            f"FAWA Ascend KV cache {name} must be tuple/list-like, "
-                            f"got {type(kv_cache)}."
-                        )
-                    missing = [
-                        tensor_index
-                        for tensor_index in tensor_indices
-                        if tensor_index >= len(kv_cache)
-                    ]
-                    if missing:
-                        raise RuntimeError(
-                            f"FAWA Ascend KV cache {name} has {len(kv_cache)} "
-                            f"tensors, missing indices {missing} for group "
-                            f"{group_id}."
-                        )
-                    selected = tuple(
-                        kv_cache[tensor_index] for tensor_index in tensor_indices
-                    )
-                    group_caches[name] = selected[0] if len(selected) == 1 else selected
             if group_caches:
                 groups[group_id] = group_caches
-                used_names.update(group_caches)
 
-        missing_names = set(kv_caches) - used_names
-        if missing_names:
-            raise RuntimeError(
-                "KV cache config did not include registered caches: "
-                f"{sorted(missing_names)}"
-            )
 
         return groups
 
@@ -1117,20 +512,36 @@ class UCMFAWAConnector(UCMDirectConnector):
             else (None, None)
         )
 
-        grouped = self._split_kv_caches_by_vllm_groups(kv_caches)
-        for group_id, group_caches in grouped.items():
-            if not group_caches:
-                logger.warning(f"KV cache group {group_id} is empty.")
-                continue
-            layout = KVCacheGroupLayout(group_caches)
-            self.group_layouts[group_id] = layout
+        
+        if self.is_ascend_layout:
+            # current for ascend, one layer_tensor_name per group_spec, multi tensors per layer_tensor_name
+            tensor_mapping = {
+                "Compress4AttentionSpec" :
+                "SWAAttentionSpec"
+            }
+            next_tensor_index_by_layer: dict[str, int] = {}
+            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                kv_cache_spec_name = type(group_spec.kv_cache_spec)
+                for layer_name in group.layer_names:
+                    tensor_count = 2 if kv_cache_spec_name == "C4IndexerSpec" else 1
+                    start = next_tensor_index_by_layer.get(layer_name, 0)
+                    end = start + tensor_count
+                    next_tensor_index_by_layer[layer_name] = end
+                    group_caches[layer_name] = tuple(kv_caches[layer_name][start:end])
+                
+                layout = KVCacheGroupLayout(group_caches)
+                self.group_layouts[group_id] = layout
+        else:
+            for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
+                group_caches: dict[str, torch.Tensor] = {}
+                for layer_name in group_spec.layer_names:
+                    group_caches[layer_name] = kv_caches[layer_name]
+                layout = KVCacheGroupLayout(group_caches)
+                self.group_layouts[group_id] = layout
 
         self.store = self._create_fa_store(self.group_layouts, store_cores)
         self.fa_store = self.store
-        self.wa_store = self._create_wa_store(
-            self.group_layouts,
-            store_cores,
-        )
+        self.wa_store = self._create_wa_store(self.group_layouts, store_cores)
 
         if worker_cores:
             try:
@@ -1150,13 +561,12 @@ class UCMFAWAConnector(UCMDirectConnector):
             if layout is None:
                 continue
             meta = self.group_metas[group_id]
-            repeat = meta.tail_blocks
-            if repeat is None:
-                repeat = 1
-            for segment_tokens in meta.window_spans[:repeat]:
+            segment_tokens = meta.tail_tokens // meta.tail_blocks
+
+            for _ in range(meta.tail_blocks):
                 segment_sizes = layout.segment_tensor_size_list(
                     segment_tokens,
-                    meta.tensor_block_size,
+                    meta.token_block_size,
                 )
                 tensor_size_list.extend(segment_sizes)
         if not tensor_size_list:
@@ -1252,34 +662,24 @@ class UCMFAWAConnector(UCMDirectConnector):
         group_block_ids: list[int],
         hash_start: int,
         hash_end: int,
-        *,
+        window_boundary_token_idx,
         window_tail_only: bool,
     ) -> list[int]:
         if hash_end <= hash_start:
             return []
-        meta = self.group_metas[group_id]
-        token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
+        group_meta = self.group_metas[group_id]
         if window_tail_only:
-            if not meta.tail_blocks:
+            if not group_meta.tail_tokens:
                 return []
-            selected: list[int] = []
-            for hash_idx in range(hash_start, hash_end):
-                logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
-                logical_start = max(
-                    hash_idx * meta.logical_blocks_per_hash_block,
-                    logical_end - meta.tail_blocks,
-                )
-                alloc_start = logical_start // token_blocks_per_tensor_block
-                alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-                selected.extend(group_block_ids[alloc_start:alloc_end])
-            return selected
-
-        alloc_start = (
-            hash_start * meta.logical_blocks_per_hash_block
-        ) // token_blocks_per_tensor_block
-        logical_end = hash_end * meta.logical_blocks_per_hash_block
-        alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-        return group_block_ids[alloc_start:alloc_end]
+            boundary_block_idx = window_boundary_token_idx // group_meta.token_block_size
+            tail_offsets = np.arange(group_meta.tail_blocks) - (group_meta.tail_blocks - 1)
+            selected_idx = boundary_block_idx[:, None] + tail_offsets[None, :]
+            selected_idx = selected_idx.reshape(-1)
+           
+            return np.array(group_block_ids)[selected_idx].tolist()
+        # for fa part, hash_block_size <= token_block_size, at most one block per hash block
+        selected_idx = window_boundary_token_idx // group_meta.token_block_size
+        return np.array(group_block_ids)[selected_idx].tolist()
 
     def _generate_dispatch_meta(
         self,
@@ -1318,6 +718,7 @@ class UCMFAWAConnector(UCMDirectConnector):
             load_start = req_meta.hbm_hit_block_num
             load_end = req_meta.total_hit_block_num
             load_block_keys = req_meta.ucm_block_ids[load_start:load_end]
+            window_boundary_token_idx = np.arange(load_start,load_end) * self.hash_block_size - 1
             for group_id, group_block_ids in enumerate(all_group_block_ids):
                 load_vllm_block_ids.append(
                     self._slice_group_block_ids(
@@ -1325,6 +726,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                         group_block_ids,
                         load_end - 1 if group_id in self.window_group_ids else load_start,
                         load_end,
+                        window_boundary_token_idx,
                         window_tail_only=group_id in self.window_group_ids,
                     )
                 )
@@ -1339,6 +741,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         dump_vllm_block_ids: list[list[int]] = []
         if dump_end > dump_start:
             dump_block_keys = req_meta.ucm_block_ids[dump_start:dump_end]
+            window_boundary_token_idx = np.arange(dump_start,dump_end) * self.hash_block_size - 1
             for group_id, group_block_ids in enumerate(all_group_block_ids):
                 dump_vllm_block_ids.append(
                     self._slice_group_block_ids(
@@ -1346,6 +749,7 @@ class UCMFAWAConnector(UCMDirectConnector):
                         group_block_ids,
                         dump_start,
                         dump_end,
+                        window_boundary_token_idx,
                         window_tail_only=group_id in self.window_group_ids,
                     )
                 )
@@ -1418,8 +822,6 @@ class UCMFAWAConnector(UCMDirectConnector):
     ) -> tuple[set[str] | None, set[str] | None]:
         return None, None
 
-    def build_connector_worker_meta(self) -> KVConnectorWorkerMetadata | None:
-        return None
 
     def request_finished_all_groups(
         self,
@@ -1545,55 +947,19 @@ class UCMFAWAConnector(UCMDirectConnector):
                 f"hash range [{hash_start}, {hash_end})."
             )
 
-        rows: list[list[np.ndarray]] = [[] for _ in store_keys]
+        all_ptrs = []
         for group_id in self.fa_group_ids:
             layout = self.group_layouts.get(group_id)
             if layout is None:
                 continue
             meta = self.group_metas[group_id]
-            candidates = candidate_vllm_ids[group_id]
-            token_blocks_per_tensor_block = (
-                meta.tensor_block_size // meta.token_block_size
-            )
-            base_alloc_idx = (
-                hash_start * meta.logical_blocks_per_hash_block
-            ) // token_blocks_per_tensor_block
+            block_ids = candidate_vllm_ids[group_id]
+            token_start = np.arange(hash_start, hash_end) * self.hash_block_size
+            token_offsets = token_start % meta.token_block_size
+            group_ptrs = layout.extract_segment_addrs_batch(block_ids, token_offsets, meta.token_block_size)
+            all_ptrs.append(group_ptrs)
 
-            block_ids: list[int] = []
-            offsets: list[int] = []
-            for row_id, hash_idx in enumerate(range(hash_start, hash_end)):
-                logical_idx = hash_idx * meta.logical_blocks_per_hash_block
-                alloc_idx = logical_idx // token_blocks_per_tensor_block
-                candidate_idx = alloc_idx - base_alloc_idx
-                if candidate_idx < 0 or candidate_idx >= len(candidates):
-                    raise RuntimeError(
-                        f"FAWA FA pointer extraction missing candidate for "
-                        f"group={group_id}, hash={hash_idx}, "
-                        f"candidate_idx={candidate_idx}, "
-                        f"candidates={len(candidates)}."
-                    )
-                block_ids.append(candidates[candidate_idx])
-                offsets.append(
-                    (logical_idx % token_blocks_per_tensor_block)
-                    * meta.token_block_size
-                )
-
-            group_ptrs = layout.extract_segment_addrs_batch(
-                np.asarray(block_ids, dtype=np.int64),
-                np.asarray(offsets, dtype=np.int64),
-                meta.tensor_block_size,
-            )
-            for row_id, ptr_row in enumerate(group_ptrs):
-                rows[row_id].append(ptr_row)
-
-        if any(not row for row in rows):
-            raise ValueError("FA KV cache pointer row is empty.")
-        return np.vstack(
-            [
-                np.concatenate(row).astype(np.uint64, copy=False)
-                for row in rows
-            ]
-        )
+        return np.concatenate(all_ptrs, axis=1)
 
     def _extract_wa_ptr(self, store_keys, hash_start, hash_end, candidate_vllm_ids):
         """
@@ -1607,74 +973,27 @@ class UCMFAWAConnector(UCMDirectConnector):
                 f"hash range [{hash_start}, {hash_end})."
             )
 
-        rows: list[list[np.ndarray]] = [[] for _ in store_keys]
+        all_ptrs = []
+        window_boundary_token_idx = np.arange(hash_start,hash_end) * self.hash_block_size
         for group_id in self.window_group_ids:
             layout = self.group_layouts.get(group_id)
             if layout is None:
                 continue
             meta = self.group_metas[group_id]
-            if not meta.tail_blocks:
+            if not meta.tail_tokens:
                 continue
 
-            candidates = candidate_vllm_ids[group_id]
-            token_blocks_per_tensor_block = (
-                meta.tensor_block_size // meta.token_block_size
-            )
-            candidate_base = 0
-            block_ids: list[int] = []
-            offsets: list[int] = []
-            row_ids: list[int] = []
+            block_ids = candidate_vllm_ids[group_id]
+            if meta.tail_blocks == 1:
+                token_offsets = np.ones_like(block_ids) * (meta.token_block_size - self.hash_block_size)
+            else:
+                token_offsets = np.zeros_like(block_ids)
 
-            for row_id, hash_idx in enumerate(range(hash_start, hash_end)):
-                logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
-                logical_start = max(
-                    hash_idx * meta.logical_blocks_per_hash_block,
-                    logical_end - meta.tail_blocks,
-                )
-                tail_alloc_start = logical_start // token_blocks_per_tensor_block
-                tail_alloc_end = (
-                    (logical_end - 1) // token_blocks_per_tensor_block
-                ) + 1
-                tail_candidate_count = tail_alloc_end - tail_alloc_start
+            group_ptrs = layout.extract_segment_addrs_batch(block_ids, token_offsets, meta.token_block_size)
+            group_ptrs.reshape(len(store_keys), -1)
+            all_ptrs.append(group_ptrs)
 
-                for span_idx, span_tokens in enumerate(meta.window_spans):
-                    logical_idx = logical_end - len(meta.window_spans) + span_idx
-                    alloc_idx = logical_idx // token_blocks_per_tensor_block
-                    candidate_idx = candidate_base + alloc_idx - tail_alloc_start
-                    if candidate_idx < 0 or candidate_idx >= len(candidates):
-                        raise RuntimeError(
-                            f"FAWA WA pointer extraction missing candidate for "
-                            f"group={group_id}, hash={hash_idx}, "
-                            f"span_idx={span_idx}, "
-                            f"candidate_idx={candidate_idx}, "
-                            f"candidates={len(candidates)}."
-                        )
-                    block_ids.append(candidates[candidate_idx])
-                    offsets.append(
-                        (logical_idx % token_blocks_per_tensor_block)
-                        * meta.token_block_size
-                        + max(0, meta.token_block_size - span_tokens)
-                    )
-                    row_ids.append(row_id)
-
-                candidate_base += tail_candidate_count
-
-            group_ptrs = layout.extract_segment_addrs_batch(
-                np.asarray(block_ids, dtype=np.int64),
-                np.asarray(offsets, dtype=np.int64),
-                meta.tensor_block_size,
-            )
-            for row_id, ptr_row in zip(row_ids, group_ptrs):
-                rows[row_id].append(ptr_row)
-
-        if all(not row for row in rows):
-            raise ValueError("WA KV cache pointer row is empty.")
-        return np.vstack(
-            [
-                np.concatenate(row).astype(np.uint64, copy=False)
-                for row in rows
-            ]
-        )
+        return np.concatenate(all_ptrs, axis=1)
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
@@ -1685,9 +1004,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         for request_id, request in metadata.request_meta.items():
             if not request.load_keys:
                 continue
-            fa_anchor_vllm_block_ids = self._first_group_anchor_ids(
-                request.load_vllm_block_ids
-            )
+            fa_anchor_vllm_block_ids = {block_id for block_id in request.load_vllm_block_ids[0] if block_id >= 0}
             wa_anchor_vllm_block_ids = set()
             current_anchor_vllm_block_ids = fa_anchor_vllm_block_ids
             try:
@@ -1716,12 +1033,7 @@ class UCMFAWAConnector(UCMDirectConnector):
 
                 # WA groups only need the final matched boundary.
                 window_keys = request.load_keys[-1:]
-                wa_anchor_vllm_block_ids = self._first_group_anchor_ids_for_hash_range(
-                    request.load_vllm_block_ids,
-                    request.load_hash_end - 1,
-                    request.load_hash_end,
-                    request.load_hash_start,
-                )
+                wa_anchor_vllm_block_ids = {request.load_vllm_block_ids[0][-1]}
                 current_anchor_vllm_block_ids = wa_anchor_vllm_block_ids
                 window_ptrs = self._extract_wa_ptr(
                     window_keys,
@@ -1819,120 +1131,4 @@ class UCMFAWAConnector(UCMDirectConnector):
         except Exception as e:
             logger.error(f"dump FAWA kv cache failed. {type(e).__name__}: {e}")
 
-
-class UCMAscendFAWAConnector(UCMFAWAConnector):
-    """Ascend FAWA connector with segmented tensor KV block mapping."""
-
-    def _create_block_span_layout(self) -> Optional[FAWABlockSpanLayout]:
-        return FAWABlockSpanLayout(self._kv_cache_config, self.fa_group_ids)
-
-    def _get_hash_block_size(self) -> int:
-        if self.block_span_layout is None:
-            raise RuntimeError("Ascend FAWA connector requires block span layout.")
-        return self.block_span_layout.hash_block_size
-
-    def _ascend_window_tail_tokens(self, group_id: int) -> Optional[int]:
-        group_spec = self._kv_cache_config.kv_cache_groups[group_id]
-        window_tokens = FAWABlockSpanLayout.group_window_tokens(group_spec)
-        if window_tokens is None or self.block_span_layout.is_swa_group(group_id):
-            return window_tokens
-        compress_ratio = self.block_span_layout.state_compress_ratio(group_id)
-        if compress_ratio is None:
-            return window_tokens
-        return max(0, window_tokens - compress_ratio)
-
-    def _init_group_metas(self) -> None:
-        if self.block_span_layout is None:
-            raise RuntimeError("Ascend FAWA connector requires block span layout.")
-        self._ascend_layout = self.block_span_layout.is_ascend
-
-        groups = self._kv_cache_config.kv_cache_groups
-        if not groups:
-            raise RuntimeError("FAWA connector found no KV cache groups.")
-
-        token_block_sizes: list[int] = []
-        tensor_block_sizes: list[int] = []
-        for group_id, group in enumerate(groups):
-            token_block_size = self.block_span_layout._ascend_group_token_block_size(
-                group
-            )
-            detected = {
-                tensor_block_size
-                for spec in self.block_span_layout.group_specs(group)
-                if (
-                    tensor_block_size
-                    := self.block_span_layout.spec_tensor_block_size(spec)
-                )
-                is not None
-            }
-            if len(detected) > 1:
-                raise RuntimeError(
-                    f"FAWA Ascend group {group_id} has mixed tensor "
-                    f"block sizes: {sorted(detected)}."
-                )
-            tensor_block_size = detected.pop() if detected else token_block_size
-            token_block_sizes.append(token_block_size)
-            tensor_block_sizes.append(tensor_block_size)
-
-        self._validate_group_token_block_sizes(tuple(token_block_sizes))
-
-        tail_blocks: list[Optional[int]] = [None] * len(token_block_sizes)
-        window_spans: list[tuple[int, ...]] = [(size,) for size in token_block_sizes]
-        for group_id in self.window_group_ids:
-            group_token_block_size = token_block_sizes[group_id]
-            window_tail_tokens = self._ascend_window_tail_tokens(group_id)
-            if window_tail_tokens is None:
-                tail_blocks[group_id] = self.hash_block_size // group_token_block_size
-            elif window_tail_tokens == 0:
-                tail_blocks[group_id] = 0
-            elif self.block_span_layout.is_swa_group(group_id):
-                tail_blocks[group_id] = max(
-                    1,
-                    math.ceil(window_tail_tokens / group_token_block_size),
-                )
-            else:
-                tail_blocks[group_id] = math.ceil(
-                    window_tail_tokens / group_token_block_size
-                )
-
-            if tail_blocks[group_id] == 0:
-                window_spans[group_id] = ()
-                continue
-            window_tail_tokens = self._ascend_window_tail_tokens(group_id)
-            if window_tail_tokens is None or self.block_span_layout.is_swa_group(
-                group_id
-            ):
-                window_spans[group_id] = (
-                    group_token_block_size,
-                ) * int(tail_blocks[group_id])
-                continue
-            group_spans: list[int] = []
-            while window_tail_tokens > 0:
-                segment_tokens = min(group_token_block_size, window_tail_tokens)
-                group_spans.append(segment_tokens)
-                window_tail_tokens -= segment_tokens
-            window_spans[group_id] = tuple(reversed(group_spans))
-
-        self.group_metas = {}
-        for group_id, token_block_size in enumerate(token_block_sizes):
-            tensor_block_size = tensor_block_sizes[group_id]
-            if tensor_block_size % token_block_size != 0:
-                raise RuntimeError(
-                    f"FAWA group {group_id} logical block size "
-                    f"{token_block_size} must divide tensor block size "
-                    f"{tensor_block_size}."
-                )
-            self.group_metas[group_id] = KVCacheGroupMeta(
-                group_id=group_id,
-                token_block_size=token_block_size,
-                tensor_block_size=tensor_block_size,
-                logical_blocks_per_hash_block=(
-                    self.hash_block_size // token_block_size
-                ),
-                hash_blocks_per_tensor_block=max(
-                    1,
-                    tensor_block_size // self.hash_block_size,
-                ),
-                tail_blocks=tail_blocks[group_id],
-                window_spans=window_spans[group_id],
-            )
+    
