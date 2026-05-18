@@ -187,8 +187,14 @@ class TensorRegistry:
 
     def register_layouts(self, layouts: dict[int, KVCacheGroupLayout]) -> None:
         for layout in layouts.values():
-            for tensor in layout.view_tensors:
-                self.by_ptr[int(tensor.data_ptr())] = tensor
+            for tensor_or_tuple in layout.kvcaches.values():
+                tensors = (
+                    tensor_or_tuple
+                    if isinstance(tensor_or_tuple, tuple)
+                    else (tensor_or_tuple,)
+                )
+                for tensor in tensors:
+                    self.by_ptr[int(tensor.data_ptr())] = tensor
 
     def _view_for_ptr(self, ptr: int, size: int) -> torch.Tensor:
         for base_ptr, tensor in self.by_ptr.items():
@@ -505,12 +511,7 @@ def build_allocation(
         for canonical_idx in range(canonical_blocks):
             computed_end = (canonical_idx + 1) * connector.hash_block_size
             for group_block_idx in group_block_range(connector, group_id, computed_end):
-                tensor_idx = (
-                    group_block_idx
-                    * meta.token_block_size
-                    // meta.tensor_block_size
-                )
-                max_tensor_idx = max(max_tensor_idx, tensor_idx)
+                max_tensor_idx = max(max_tensor_idx, group_block_idx)
         allocation.append([base_block_id + idx for idx in range(max_tensor_idx + 1)])
     return tuple(allocation)
 
@@ -541,28 +542,14 @@ def dump_candidate_count(
     hash_end: int,
 ) -> int:
     meta = connector.group_metas[group_id]
-    token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
     if group_id in connector.window_group_ids:
-        if not meta.tail_blocks:
+        if not meta.tail_tokens:
             return 0
-        expected = 0
-        for hash_idx in range(hash_start, hash_end):
-            logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
-            logical_start = max(
-                hash_idx * meta.logical_blocks_per_hash_block,
-                logical_end - meta.tail_blocks,
-            )
-            alloc_start = logical_start // token_blocks_per_tensor_block
-            alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-            expected += alloc_end - alloc_start
-        return expected
+        return (hash_end - hash_start) * meta.tail_blocks
 
-    alloc_start = (
-        hash_start * meta.logical_blocks_per_hash_block
-    ) // token_blocks_per_tensor_block
-    logical_end = hash_end * meta.logical_blocks_per_hash_block
-    alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-    return alloc_end - alloc_start
+    boundary_tokens = np.arange(hash_start, hash_end) * connector.hash_block_size - 1
+    selected = boundary_tokens // meta.token_block_size
+    return len(set(selected.tolist()))
 
 
 def allocation_delta(

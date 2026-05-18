@@ -2,24 +2,179 @@ from __future__ import annotations
 
 import hashlib
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import pytest
 import torch
-from test_hma_connector_chunk_prefill import (
-    FakeBlock,
-    FakeCachedRequestData,
-    FakeKVCacheBlocks,
-    FakeRequest,
-    FakeSchedulerOutput,
-    make_ascend_connector,
-)
 
 from ucm.integration.vllm.hma_connector import (
+    FAWARequestMeta,
+    KVCacheGroupMeta,
     KVCacheGroupLayout,
     UCMFAWAConnector,
     UCMFAWAConnectorMetadata,
 )
+
+
+@dataclass
+class FakeBlock:
+    block_id: int
+    is_null: bool = False
+
+
+@dataclass
+class FakeKVCacheBlocks:
+    blocks: tuple[list[FakeBlock], ...]
+
+
+@dataclass
+class FakeRequest:
+    request_id: str
+    all_token_ids: list[int] | None = None
+    num_tokens: int = 0
+    block_hashes: list[bytes] | None = None
+
+
+@dataclass
+class FakeCachedRequestData:
+    req_ids: list[str]
+    resumed_req_ids: set[str]
+    new_block_ids: list[tuple[list[int], ...] | None]
+
+
+@dataclass
+class FakeSchedulerOutput:
+    scheduled_new_reqs: list
+    scheduled_cached_reqs: FakeCachedRequestData
+    num_scheduled_tokens: dict[str, int]
+    finished_req_ids: set[str]
+
+
+class AscendKVCacheGroupSpec:
+    def __init__(self, layer_names, kv_cache_spec):
+        self.layer_names = layer_names
+        self.kv_cache_spec = kv_cache_spec
+
+
+@dataclass
+class FakeKVCacheConfig:
+    kv_cache_groups: list[AscendKVCacheGroupSpec]
+
+
+def make_spec(name: str, **attrs):
+    spec = type(name, (), {})()
+    for key, value in attrs.items():
+        setattr(spec, key, value)
+    return spec
+
+
+def make_ascend_connector() -> UCMFAWAConnector:
+    c4_layers = [f"layer.{i}.c4" for i in range(21)]
+    c128_layers = [f"layer.{i}.c128" for i in range(20)]
+    swa_a_layers = [*c4_layers, "layer.extra.swa_a"]
+    swa_b_layers = [*c128_layers, "layer.extra.swa_b", "mtp.extra.swa_b"]
+    connector = UCMFAWAConnector.__new__(UCMFAWAConnector)
+    connector._kv_cache_config = FakeKVCacheConfig(
+        [
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "Compress4AttentionSpec",
+                    block_size=128,
+                    compress_ratio=4,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                swa_a_layers,
+                make_spec(
+                    "SWAAttentionSpec",
+                    block_size=128,
+                    sliding_window=128,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                swa_b_layers,
+                make_spec(
+                    "SWAAttentionSpec",
+                    block_size=128,
+                    sliding_window=128,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "C4IndexerSpec",
+                    block_size=1024,
+                    compress_ratio=4,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "C4AttnKVStateSpec",
+                    block_size=32,
+                    sliding_window=8,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "C4AttnScoreStateSpec",
+                    block_size=32,
+                    sliding_window=8,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "C4IndexerKVStateSpec",
+                    block_size=128,
+                    sliding_window=8,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c4_layers,
+                make_spec(
+                    "C4IndexerScoreStateSpec",
+                    block_size=128,
+                    sliding_window=8,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c128_layers,
+                make_spec(
+                    "Compress128AttentionSpec",
+                    block_size=128,
+                    compress_ratio=128,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c128_layers,
+                make_spec(
+                    "C128AttnKVStateSpec",
+                    block_size=64,
+                    sliding_window=128,
+                ),
+            ),
+            AscendKVCacheGroupSpec(
+                c128_layers,
+                make_spec(
+                    "C128AttnScoreStateSpec",
+                    block_size=64,
+                    sliding_window=128,
+                ),
+            ),
+        ]
+    )
+    connector.hash_block_size = UCMFAWAConnector.DEFAULT_HASH_BLOCK_SIZE
+    connector.is_ascend_layout = False
+    connector.fa_group_ids = []
+    connector.window_group_ids = []
+    connector.group_metas = {}
+    connector._init_group_metas()
+    connector.requests_meta = {}
+    return connector
 
 
 def hbm_device() -> torch.device:
@@ -93,8 +248,14 @@ class TensorKVStore:
 
     def register_layouts(self, layouts: dict[int, KVCacheGroupLayout]) -> None:
         for layout in layouts.values():
-            for tensor in layout.view_tensors:
-                self.ptr_registry[int(tensor.data_ptr())] = tensor
+            for tensor_or_tuple in layout.kvcaches.values():
+                tensors = (
+                    tensor_or_tuple
+                    if isinstance(tensor_or_tuple, tuple)
+                    else (tensor_or_tuple,)
+                )
+                for tensor in tensors:
+                    self.ptr_registry[int(tensor.data_ptr())] = tensor
 
     def _view_for_ptr(self, ptr: int, size: int) -> torch.Tensor:
         for base_ptr, tensor in self.ptr_registry.items():
@@ -153,11 +314,7 @@ def build_allocation(
         for canonical_idx in range(canonical_blocks):
             computed_end = (canonical_idx + 1) * connector.hash_block_size
             for group_block_idx in group_block_range(connector, group_id, computed_end):
-                tensor_idx = connector.block_span_layout.allocation_index(
-                    group_id,
-                    group_block_idx,
-                )
-                max_tensor_idx = max(max_tensor_idx, tensor_idx)
+                max_tensor_idx = max(max_tensor_idx, group_block_idx)
         allocation.append([base_block_id + idx for idx in range(max_tensor_idx + 1)])
     return tuple(allocation)
 
@@ -188,28 +345,14 @@ def dump_candidate_count(
     hash_end: int,
 ) -> int:
     meta = connector.group_metas[group_id]
-    token_blocks_per_tensor_block = meta.tensor_block_size // meta.token_block_size
     if group_id in connector.window_group_ids:
-        if not meta.tail_blocks:
+        if not meta.tail_tokens:
             return 0
-        expected = 0
-        for hash_idx in range(hash_start, hash_end):
-            logical_end = (hash_idx + 1) * meta.logical_blocks_per_hash_block
-            logical_start = max(
-                hash_idx * meta.logical_blocks_per_hash_block,
-                logical_end - meta.tail_blocks,
-            )
-            alloc_start = logical_start // token_blocks_per_tensor_block
-            alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-            expected += alloc_end - alloc_start
-        return expected
+        return (hash_end - hash_start) * meta.tail_blocks
 
-    alloc_start = (
-        hash_start * meta.logical_blocks_per_hash_block
-    ) // token_blocks_per_tensor_block
-    logical_end = hash_end * meta.logical_blocks_per_hash_block
-    alloc_end = ((logical_end - 1) // token_blocks_per_tensor_block) + 1
-    return alloc_end - alloc_start
+    boundary_tokens = np.arange(hash_start, hash_end) * connector.hash_block_size - 1
+    selected = boundary_tokens // meta.token_block_size
+    return len(set(selected.tolist()))
 
 
 def allocation_delta(
@@ -259,8 +402,7 @@ def make_worker(
     worker.fa_group_ids = scheduler.fa_group_ids
     worker.window_group_ids = scheduler.window_group_ids
     worker.group_metas = dict(scheduler.group_metas)
-    worker.block_span_layout = scheduler.block_span_layout
-    worker._ascend_layout = scheduler._ascend_layout
+    worker.is_ascend_layout = scheduler.is_ascend_layout
     worker.group_layouts = group_layouts
     worker.fa_store = fa_store
     worker.wa_store = wa_store
@@ -456,7 +598,9 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
                 set(),
                 [first_deltas[request.request_id] for request in requests],
             ),
-            num_scheduled_tokens={request.request_id: 512 for request in requests},
+            num_scheduled_tokens={
+                request.request_id: scheduler.hash_block_size for request in requests
+            },
             finished_req_ids=set(),
         )
     )
@@ -481,7 +625,9 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
                 set(),
                 [second_deltas[request.request_id] for request in requests],
             ),
-            num_scheduled_tokens={request.request_id: 512 for request in requests},
+            num_scheduled_tokens={
+                request.request_id: scheduler.hash_block_size for request in requests
+            },
             finished_req_ids=set(),
         )
     )
@@ -549,17 +695,12 @@ def test_ascend_tp4_end_to_end_partial_external_hit_multi_request_chunk_prefill(
     req_a_meta = final_metadata.request_meta["req-a"]
     for group_id in scheduler.fa_group_ids:
         meta = scheduler.group_metas[group_id]
-        token_blocks_per_tensor_block = (
-            meta.tensor_block_size // meta.token_block_size
+        boundary_tokens = (
+            np.arange(req_a_meta.dump_hash_start, req_a_meta.dump_hash_end)
+            * scheduler.hash_block_size
+            - 1
         )
-        expected = math.ceil(
-            (req_a_meta.dump_hash_end * meta.logical_blocks_per_hash_block)
-            / token_blocks_per_tensor_block
-        ) - (
-            req_a_meta.dump_hash_start
-            * meta.logical_blocks_per_hash_block
-            // token_blocks_per_tensor_block
-        )
+        expected = len(set((boundary_tokens // meta.token_block_size).tolist()))
         assert len(req_a_meta.dump_vllm_block_ids[group_id]) == expected
     for group_id in scheduler.window_group_ids:
         if scheduler.group_metas[group_id].tail_blocks == 0:

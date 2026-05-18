@@ -33,8 +33,6 @@ logger = init_logger(__name__)
 class KVCacheGroupMeta:
     group_id: int
     token_block_size: int
-    # compress_ratio is used for Ascend Setting, where 
-    compress_ratio: int
     tail_blocks: int
     tail_tokens: int
 
@@ -245,6 +243,7 @@ class UCMFAWAConnector(UCMDirectConnector):
     """
 
     DEFAULT_HASH_BLOCK_SIZE = 256
+    ASCEND_DEFAULT_HASH_BLOCK_SIZE = 512
 
     def __init__(
         self,
@@ -255,7 +254,6 @@ class UCMFAWAConnector(UCMDirectConnector):
         self._defer_scheduler_store = True
         super().__init__(vllm_config, role, kv_cache_config)
         self.hash_block_size = self.DEFAULT_HASH_BLOCK_SIZE
-        self.block_size = self.DEFAULT_HASH_BLOCK_SIZE
         self.group_layouts: dict[int, KVCacheGroupLayout] = {}
         if self._kv_cache_config is None:
             raise RuntimeError("FAWA connector requires kv_cache_config.")
@@ -275,7 +273,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             {
                 "group_id": meta.group_id,
                 "token_block_size": meta.token_block_size,
-                "compress_ratio": meta.compress_ratio,
                 "tail_blocks": meta.tail_blocks,
                 "window_spans": meta.tail_tokens,
             }
@@ -297,9 +294,11 @@ class UCMFAWAConnector(UCMDirectConnector):
             return False
         
         kv_cache_groups = kv_cache_config.kv_cache_groups
-        spec_names = {
-            type(groupspec.kv_cache_spec).__name__ for groupspec in kv_cache_groups
-        }
+        spec_names = set()
+        for group_spec in kv_cache_groups:
+            nested_specs = getattr(group_spec.kv_cache_spec, "kv_cache_specs", None)
+            spec = next(iter(nested_specs.values())) if nested_specs else group_spec.kv_cache_spec
+            spec_names.add(type(spec).__name__)
         # current only support for DeepSeekV4
         DS_V4_REQUIRED_SPECS = frozenset({"SlidingWindowMLASpec"})
         gpu_support = DS_V4_REQUIRED_SPECS.issubset(spec_names)
@@ -313,9 +312,11 @@ class UCMFAWAConnector(UCMDirectConnector):
         if kv_cache_config is None:
             return False
         kv_cache_groups = kv_cache_config.kv_cache_groups
-        spec_names = {
-            type(groupspec.kv_cache_spec).__name__ for groupspec in kv_cache_groups
-        }
+        spec_names = set()
+        for group_spec in kv_cache_groups:
+            nested_specs = getattr(group_spec.kv_cache_spec, "kv_cache_specs", None)
+            spec = next(iter(nested_specs.values())) if nested_specs else group_spec.kv_cache_spec
+            spec_names.add(type(spec).__name__)
         ASCEND_REQUIRED_SPECS = frozenset(
             {"Compress4AttentionSpec", "C4IndexerSpec", "Compress128AttentionSpec"}
         )
@@ -325,14 +326,17 @@ class UCMFAWAConnector(UCMDirectConnector):
     def _init_group_metas(self) -> None:
         if self.can_handle_ascend_kv_cache_config(self._kv_cache_config):
             self.is_ascend_layout = True
+            self.hash_block_size = self.ASCEND_DEFAULT_HASH_BLOCK_SIZE
             
         groups = self._kv_cache_config.kv_cache_groups
         self.fa_group_ids, self.window_group_ids = [], []
         for group_id, group in enumerate(groups):
             kv_cache_spec = group.kv_cache_spec
             # handle attention window cache
-            window_size = getattr(kv_cache_spec, "sliding_window", None)
-            compress_ratio = getattr(kv_cache_spec, "compress_ratio", 1)
+            nested_specs = getattr(kv_cache_spec, "kv_cache_specs", None)
+            spec = next(iter(nested_specs.values())) if nested_specs else kv_cache_spec
+            window_size = getattr(spec, "sliding_window", None)
+            compress_ratio = getattr(spec, "compress_ratio", 1)
             token_block_size = kv_cache_spec.block_size
 
             if self.is_ascend_layout:
@@ -355,7 +359,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             self.group_metas[group_id] = KVCacheGroupMeta(
                 group_id=group_id,
                 token_block_size=token_block_size,
-                compress_ratio=compress_ratio,
                 tail_blocks=tail_blocks,
                 tail_tokens=tail_tokens
             )
@@ -696,14 +699,15 @@ class UCMFAWAConnector(UCMDirectConnector):
             load_block_keys = req_meta.ucm_block_ids[load_start:load_end]
             window_boundary_token_idx = np.arange(load_start,load_end) * self.hash_block_size - 1
             for group_id, group_block_ids in enumerate(all_group_block_ids):
+                is_window_group = group_id in self.window_group_ids
                 load_vllm_block_ids.append(
                     self._slice_group_block_ids(
                         group_id,
                         group_block_ids,
-                        load_end - 1 if group_id in self.window_group_ids else load_start,
+                        load_end - 1 if is_window_group else load_start,
                         load_end,
-                        window_boundary_token_idx,
-                        window_tail_only=group_id in self.window_group_ids,
+                        window_boundary_token_idx[-1:] if is_window_group else window_boundary_token_idx,
+                        window_tail_only=is_window_group,
                     )
                 )
 
@@ -964,8 +968,10 @@ class UCMFAWAConnector(UCMDirectConnector):
             else:
                 token_offsets = np.zeros_like(block_ids)
 
-            group_ptrs = layout.extract_segment_addrs_batch(block_ids, token_offsets, meta.token_block_size)
-            group_ptrs.reshape(len(store_keys), -1)
+            group_ptrs = layout.extract_segment_addrs_batch(
+                block_ids, token_offsets, meta.token_block_size
+            )
+            group_ptrs = group_ptrs.reshape(len(store_keys), -1)
             all_ptrs.append(group_ptrs)
 
         return np.concatenate(all_ptrs, axis=1)
