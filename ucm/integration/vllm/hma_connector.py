@@ -298,7 +298,7 @@ class UCMFAWAConnector(UCMDirectConnector):
         
         kv_cache_groups = kv_cache_config.kv_cache_groups
         spec_names = {
-            type(spec).__name__ for group in kv_cache_groups for spec in group.kv_cache_spec
+            type(groupspec.kv_cache_spec).__name__ for groupspec in kv_cache_groups
         }
         # current only support for DeepSeekV4
         DS_V4_REQUIRED_SPECS = frozenset({"SlidingWindowMLASpec"})
@@ -314,12 +314,12 @@ class UCMFAWAConnector(UCMDirectConnector):
             return False
         kv_cache_groups = kv_cache_config.kv_cache_groups
         spec_names = {
-            type(spec).__name__ for group in kv_cache_groups for spec in group.kv_cache_spec
+            type(groupspec.kv_cache_spec).__name__ for groupspec in kv_cache_groups
         }
         ASCEND_REQUIRED_SPECS = frozenset(
             {"Compress4AttentionSpec", "C4IndexerSpec", "Compress128AttentionSpec"}
         )
-        npu_support = type(kv_cache_groups).__name__.startswith("Ascend") and ASCEND_REQUIRED_SPECS.issubset(spec_names)
+        npu_support = type(kv_cache_groups[0]).__name__.startswith("Ascend") and ASCEND_REQUIRED_SPECS.issubset(spec_names)
         return npu_support
     
     def _init_group_metas(self) -> None:
@@ -480,27 +480,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             summary["tensor_bytes"] = sum(tensor_sizes)
         return summary
 
-    def _split_kv_caches_by_vllm_groups(
-        self, kv_caches: dict[str, torch.Tensor]
-    ) -> dict[int, dict[str, torch.Tensor]]:
-        groups: dict[int, dict[str, torch.Tensor]] = {}
-        for group_id, group_spec in enumerate(self._kv_cache_config.kv_cache_groups):
-            group_caches: dict[str, torch.Tensor] = {}
-            for name in group_spec.layer_names:
-                if name not in kv_caches:
-                    continue
-                kv_cache = kv_caches[name]
-                tensor_indices = (
-                    self.block_span_layout.group_tensor_indices(group_id, name)
-                    if self.block_span_layout is not None
-                    else None
-                )
-            if group_caches:
-                groups[group_id] = group_caches
-
-
-        return groups
-
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         self.kv_caches = kv_caches
         self.device = create_device()
@@ -515,13 +494,10 @@ class UCMFAWAConnector(UCMDirectConnector):
         
         if self.is_ascend_layout:
             # current for ascend, one layer_tensor_name per group_spec, multi tensors per layer_tensor_name
-            tensor_mapping = {
-                "Compress4AttentionSpec" :
-                "SWAAttentionSpec"
-            }
             next_tensor_index_by_layer: dict[str, int] = {}
-            for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
-                kv_cache_spec_name = type(group_spec.kv_cache_spec)
+            for group_id, group in enumerate(self._kv_cache_config.kv_cache_groups):
+                kv_cache_spec_name = type(group.kv_cache_spec).__name__
+                group_caches: dict[str, torch.Tensor] = {}
                 for layer_name in group.layer_names:
                     tensor_count = 2 if kv_cache_spec_name == "C4IndexerSpec" else 1
                     start = next_tensor_index_by_layer.get(layer_name, 0)
@@ -953,7 +929,7 @@ class UCMFAWAConnector(UCMDirectConnector):
             if layout is None:
                 continue
             meta = self.group_metas[group_id]
-            block_ids = candidate_vllm_ids[group_id]
+            block_ids = np.asarray(candidate_vllm_ids[group_id], dtype=np.uint64)
             token_start = np.arange(hash_start, hash_end) * self.hash_block_size
             token_offsets = token_start % meta.token_block_size
             group_ptrs = layout.extract_segment_addrs_batch(block_ids, token_offsets, meta.token_block_size)
@@ -974,7 +950,6 @@ class UCMFAWAConnector(UCMDirectConnector):
             )
 
         all_ptrs = []
-        window_boundary_token_idx = np.arange(hash_start,hash_end) * self.hash_block_size
         for group_id in self.window_group_ids:
             layout = self.group_layouts.get(group_id)
             if layout is None:
@@ -983,9 +958,9 @@ class UCMFAWAConnector(UCMDirectConnector):
             if not meta.tail_tokens:
                 continue
 
-            block_ids = candidate_vllm_ids[group_id]
+            block_ids = np.asarray(candidate_vllm_ids[group_id], dtype=np.uint64)
             if meta.tail_blocks == 1:
-                token_offsets = np.ones_like(block_ids) * (meta.token_block_size - self.hash_block_size)
+                token_offsets = np.ones_like(block_ids) * (meta.token_block_size - meta.tail_tokens)
             else:
                 token_offsets = np.zeros_like(block_ids)
 
