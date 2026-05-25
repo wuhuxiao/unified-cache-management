@@ -15,8 +15,10 @@ ucm_connectors:
     ucm_connector_config:
       store_pipeline: "Cache|Posix"
       storage_backends: "/mnt/test"
-      io_direct: false
-      # cache_buffer_capacity_gb: 256
+      io_direct: true
+      posix_io_engine: aio
+      share_buffer_enable: true
+      cache_buffer_capacity_gb: 32
       # posix_capacity_gb: 1024
 
       # Enable GPUDirect RDMA transfers for CacheStore/PcStore H2D and D2H copies.
@@ -35,7 +37,7 @@ enable_event_sync: true
 
 
 # Whether to use layerwise loading/saving (optional, default: True for UCMConnector)
-use_layerwise: true
+use_layerwise: false
 # hit_ratio: 0.9
 
 # Whether to record requests' traces (optional, default: False)
