@@ -17,6 +17,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
+)
 from vllm.distributed.parallel_state import get_world_group
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import current_platform
@@ -2874,6 +2880,9 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
     def build_connector_worker_meta(self):
         return self.connector.build_connector_worker_meta()
 
+    def get_kv_connector_stats(self) -> KVConnectorStats | None:
+        return self.connector.get_kv_connector_stats()
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         return self.connector.update_connector_output(connector_output)
 
@@ -2894,3 +2903,35 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             Empty set if no load errors occurred.
         """
         return self.connector.get_block_ids_with_load_errors()
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls,
+        data: dict[str, Any] | None = None,
+    ) -> KVConnectorStats | None:
+        from ucm.integration.vllm.hma_connector import (
+            FAWA_CONNECTOR_TYPE,
+            FAWA_CONNECTOR_TYPE_KEY,
+            UCMFAWAConnector,
+        )
+
+        if data is None or data.get(FAWA_CONNECTOR_TYPE_KEY) == FAWA_CONNECTOR_TYPE:
+            return UCMFAWAConnector.build_kv_connector_stats(data)
+        return None
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: VllmConfig,
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics | None:
+        from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+
+        return UCMFAWAConnector.build_prom_metrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )

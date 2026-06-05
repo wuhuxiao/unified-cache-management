@@ -1,8 +1,11 @@
 import copy
 import math
 import os
+import time
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, Sequence, Tuple
+from functools import wraps
+from typing import TYPE_CHECKING, Any, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -10,6 +13,12 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     KVConnectorRole,
     SupportsHMA,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
+    KVConnectorPromMetrics,
+    KVConnectorStats,
+    PromMetric,
+    PromMetricT,
 )
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -29,6 +38,160 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+FAWA_CONNECTOR_TYPE_KEY = "__ucm_connector_type__"
+FAWA_CONNECTOR_TYPE = "fawa"
+FAWA_METRICS_KEY = "metrics"
+
+
+def _fawa_empty_stats_data() -> dict[str, Any]:
+    return {FAWA_CONNECTOR_TYPE_KEY: FAWA_CONNECTOR_TYPE, FAWA_METRICS_KEY: {}}
+
+
+def _nearest_rank_percentile(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    sorted_values = sorted(values)
+    rank = max(
+        0,
+        min(len(sorted_values) - 1, int(percentile * len(sorted_values) - 1e-12)),
+    )
+    return sorted_values[rank]
+
+
+def _split_fawa_latency_metric(metric_name: str) -> tuple[str, str]:
+    name = metric_name
+    if name.endswith("_ms"):
+        name = name[:-3]
+    if name.startswith("fawa_scheduler_"):
+        return "scheduler", name[len("fawa_scheduler_") :]
+    if name.startswith("fawa_worker_"):
+        return "worker", name[len("fawa_worker_") :]
+    return "unknown", name
+
+
+def fawa_latency_metric(metric_name: str, *, worker_side: bool):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(self, *args, **kwargs):
+            if not getattr(self, "_fawa_stats_enabled", True):
+                return func(self, *args, **kwargs)
+            start = time.perf_counter()
+            try:
+                return func(self, *args, **kwargs)
+            finally:
+                duration_ms = (time.perf_counter() - start) * 1e3
+                self._record_fawa_latency(
+                    metric_name,
+                    duration_ms,
+                    worker_side=worker_side,
+                )
+
+        return wrapper
+
+    return decorator
+
+
+@dataclass
+class UCMFAWAKVConnectorStats(KVConnectorStats):
+    def __post_init__(self):
+        if not self.data:
+            self.reset()
+            return
+        self.data.setdefault(FAWA_CONNECTOR_TYPE_KEY, FAWA_CONNECTOR_TYPE)
+        self.data.setdefault(FAWA_METRICS_KEY, {})
+
+    def reset(self):
+        self.data = _fawa_empty_stats_data()
+
+    def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        if not isinstance(other, UCMFAWAKVConnectorStats) or other.is_empty():
+            return self
+        metrics = self.data.setdefault(FAWA_METRICS_KEY, {})
+        for name, values in other.data.get(FAWA_METRICS_KEY, {}).items():
+            metrics.setdefault(name, []).extend(values)
+        return self
+
+    def reduce(self) -> dict[str, int | float]:
+        reduced: dict[str, int | float] = {}
+        for name, values in sorted(self.data.get(FAWA_METRICS_KEY, {}).items()):
+            if not values:
+                continue
+            vals = [float(value) for value in values]
+            reduced[f"{name}_avg"] = round(sum(vals) / len(vals), 3)
+            reduced[f"{name}_p50"] = round(_nearest_rank_percentile(vals, 0.5), 3)
+            reduced[f"{name}_p95"] = round(_nearest_rank_percentile(vals, 0.95), 3)
+            reduced[f"{name}_max"] = round(max(vals), 3)
+            reduced[f"{name}_count"] = len(vals)
+        return reduced
+
+    def is_empty(self) -> bool:
+        return not any(self.data.get(FAWA_METRICS_KEY, {}).values())
+
+
+class UCMFAWAPromMetrics(KVConnectorPromMetrics):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ):
+        super().__init__(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+        metric_labelnames = labelnames + ["side", "function"]
+        self._metric_cache: dict[tuple[int, str, str], dict[str, Any]] = {}
+        self._histogram_latency_ms = self._histogram_cls(
+            name="vllm:kv_connector_fawa_latency_ms",
+            documentation="Histogram of UCM FAWA KV connector interface latency.",
+            buckets=[
+                1.0,
+                2.5,
+                5.0,
+                10.0,
+                15.0,
+                20.0,
+                25.0,
+                30.0,
+                50.0,
+                100.0,
+                250.0,
+                500.0,
+                1000.0,
+            ],
+            labelnames=metric_labelnames,
+        )
+        self._counter_latency_calls = self._counter_cls(
+            name="vllm:kv_connector_fawa_latency_calls_total",
+            documentation="Number of UCM FAWA KV connector latency observations.",
+            labelnames=metric_labelnames,
+        )
+
+    def _get_metrics(
+        self,
+        engine_idx: int,
+        side: str,
+        function: str,
+    ) -> dict[str, Any]:
+        cache_key = (engine_idx, side, function)
+        if cache_key not in self._metric_cache:
+            label_values = self.per_engine_labelvalues[engine_idx] + [side, function]
+            self._metric_cache[cache_key] = {
+                "latency": self._histogram_latency_ms.labels(*label_values),
+                "calls": self._counter_latency_calls.labels(*label_values),
+            }
+        return self._metric_cache[cache_key]
+
+    def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+        stats = UCMFAWAKVConnectorStats(data=transfer_stats_data)
+        for name, values in stats.data.get(FAWA_METRICS_KEY, {}).items():
+            if not name.endswith("_ms") or not values:
+                continue
+            side, function = _split_fawa_latency_metric(name)
+            metrics = self._get_metrics(engine_idx, side, function)
+            for value in values:
+                metrics["latency"].observe(float(value))
+            metrics["calls"].inc(len(values))
 
 
 @dataclass(frozen=True)
@@ -301,6 +464,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         self.requests_meta: dict[str, FAWARequestMeta] = {}
         self.tp_dump_tasks: dict[tuple, list[FAWADumpTask]] = {}
         self.wa_dump_block_wise = self.launch_config.get("wa_dump_block_wise", True)
+        self._fawa_scheduler_latencies: dict[str, list[float]] = defaultdict(list)
+        self._fawa_worker_latencies: dict[str, list[float]] = defaultdict(list)
+        self._fawa_stats_enabled = self.launch_config.get(
+            "enable_fawa_func_metrics", True
+        )
 
         if role == KVConnectorRole.SCHEDULER:
             self.store = self._create_fa_store(None)
@@ -322,6 +490,86 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             f"group_metas={group_meta_summary}"
         )
         logger.info("Init UCM FAWA connector.")
+
+    def _record_fawa_latency(
+        self,
+        name: str,
+        value_ms: float,
+        *,
+        worker_side: bool,
+    ) -> None:
+        if not getattr(self, "_fawa_stats_enabled", True):
+            return
+        if not hasattr(self, "_fawa_scheduler_latencies"):
+            self._fawa_scheduler_latencies = defaultdict(list)
+        if not hasattr(self, "_fawa_worker_latencies"):
+            self._fawa_worker_latencies = defaultdict(list)
+        target = (
+            self._fawa_worker_latencies
+            if worker_side
+            else self._fawa_scheduler_latencies
+        )
+        target[name].append(float(value_ms))
+
+    def _snapshot_and_clear_fawa_latencies(
+        self,
+        *,
+        worker_side: bool,
+    ) -> dict[str, list[float]]:
+        if not hasattr(self, "_fawa_scheduler_latencies"):
+            self._fawa_scheduler_latencies = defaultdict(list)
+        if not hasattr(self, "_fawa_worker_latencies"):
+            self._fawa_worker_latencies = defaultdict(list)
+        source = (
+            self._fawa_worker_latencies
+            if worker_side
+            else self._fawa_scheduler_latencies
+        )
+        snapshot = {name: list(values) for name, values in source.items() if values}
+        source.clear()
+        return snapshot
+
+    @staticmethod
+    def _build_fawa_stats(
+        latencies: dict[str, list[float]],
+    ) -> Optional[UCMFAWAKVConnectorStats]:
+        if not any(latencies.values()):
+            return None
+        return UCMFAWAKVConnectorStats(
+            {
+                FAWA_CONNECTOR_TYPE_KEY: FAWA_CONNECTOR_TYPE,
+                FAWA_METRICS_KEY: latencies,
+            }
+        )
+
+    def get_kv_connector_stats(self) -> Optional[KVConnectorStats]:
+        if self._role == KVConnectorRole.WORKER:
+            latencies = self._snapshot_and_clear_fawa_latencies(worker_side=True)
+        else:
+            latencies = self._snapshot_and_clear_fawa_latencies(worker_side=False)
+        return self._build_fawa_stats(latencies)
+
+    @classmethod
+    def build_kv_connector_stats(
+        cls,
+        data: dict[str, Any] | None = None,
+    ) -> KVConnectorStats | None:
+        return UCMFAWAKVConnectorStats(data=data or _fawa_empty_stats_data())
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config: "VllmConfig",
+        metric_types: dict[type[PromMetric], type[PromMetricT]],
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+    ) -> KVConnectorPromMetrics:
+        return UCMFAWAPromMetrics(
+            vllm_config,
+            metric_types,
+            labelnames,
+            per_engine_labelvalues,
+        )
 
     @classmethod
     def can_handle_kv_cache_config(
@@ -672,6 +920,10 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                 return hit_blocks
         return 0
 
+    @fawa_latency_metric(
+        "fawa_scheduler_get_num_new_matched_tokens_ms",
+        worker_side=False,
+    )
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -841,7 +1093,11 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
                         group_id,
                         group_block_ids,
                         window_boundary_token_idx,
-                        fetch_wa_block_wise=self.wa_dump_block_wise,
+                        fetch_wa_block_wise=getattr(
+                            self,
+                            "wa_dump_block_wise",
+                            True,
+                        ),
                     )
                 )
         req_meta.token_processed = computed_end_token
@@ -857,6 +1113,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
             dump_vllm_block_ids=tuple(dump_vllm_block_ids),
         )
 
+    @fawa_latency_metric("fawa_scheduler_build_connector_meta_ms", worker_side=False)
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> UCMFAWAConnectorMetadata:
@@ -1027,6 +1284,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
 
         return np.concatenate(all_ptrs, axis=1)
 
+    @fawa_latency_metric("fawa_worker_start_load_kv_ms", worker_side=True)
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
@@ -1087,6 +1345,7 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
         for load_task in tasks:
             self._wait_load_task(load_task)
 
+    @fawa_latency_metric("fawa_worker_wait_for_save_ms", worker_side=True)
     def wait_for_save(self) -> None:
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
