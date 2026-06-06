@@ -2137,8 +2137,6 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
     ) -> None:
         if not self._connector_metadata:
             return
-        if self.is_mla and self.tp_rank % self.tp_size != 0:
-            return
 
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, UCMFAWAConnectorMetadata):
