@@ -202,6 +202,10 @@ Status LoadQueue::HostToDeviceScatterAsync(std::shared_ptr<Trans::Stream> stream
         auto pHost = (void*)(((int8_t*)host) + offset);
         auto pDevice = device[i];
         auto size = tensorSizes_[i];
+        if (pDevice == nullptr) {
+            offset += size;
+            continue;
+        }
         auto s = stream->HostToDeviceAsync(pHost, pDevice, size);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to do H2D({}) batch({}/{}) async.", s, size, i, number);

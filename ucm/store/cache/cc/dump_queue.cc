@@ -22,6 +22,7 @@
  * SOFTWARE.
  * */
 #include "dump_queue.h"
+#include <cstring>
 #include "logger/logger.h"
 #include "metrics_api.h"
 #include "thread/cpu_affinity.h"
@@ -163,6 +164,10 @@ Status DumpQueue::DeviceToHostGatherAsync(std::shared_ptr<Trans::Stream> stream,
         auto pDevice = device[i];
         auto pHost = (void*)(((int8_t*)host) + offset);
         auto size = tensorSizes_[i];
+        if (pDevice == nullptr) {
+            offset += size;
+            continue;
+        }
         auto s = stream->DeviceToHostAsync(pDevice, pHost, size);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to do D2H({}) batch({}/{}) async.", s, size, i, number);

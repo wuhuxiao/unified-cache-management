@@ -2700,9 +2700,16 @@ class UCMConnector(KVConnectorBase_V1, SupportsHMA):
             kv_cache_config
         )
 
-        from ucm.integration.vllm.hma_connector import UCMFAWAConnector
+        from ucm.integration.vllm.hma_connector import (
+            UCMFAWAConnector,
+            UCMFAWALayerwiseConnector,
+        )
 
-        if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
+        if UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config) and use_layerwise:
+            self.connector = UCMFAWALayerwiseConnector(
+                vllm_config, role, kv_cache_config
+            )
+        elif UCMFAWAConnector.can_handle_kv_cache_config(kv_cache_config):
             self.connector = UCMFAWAConnector(vllm_config, role, kv_cache_config)
         elif use_lite:
             self.connector = UCMLiteConnector(vllm_config, role, kv_cache_config)
