@@ -1560,11 +1560,13 @@ class KVCacheLayerwiseGroupLayout:
     ) -> None:
         self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
         self.layer_id2shard_id = layer_id2shard_id
-        self.base_ptrs: dict[int, np.ndarray] = {}
-        self.block_strides: dict[int, np.ndarray] = {}
-        self.tensor_token_strides: dict[int, np.ndarray] = {}
-        self.tensor_sizes_per_token: dict[int, np.ndarray] = {}
-        self.tensor_block_sizes: dict[int, np.ndarray] = {}
+        self.base_ptrs: list[np.ndarray] = []
+        self.block_strides: list[np.ndarray] = []
+        self.tensor_token_strides: list[np.ndarray] = []
+        self.tensor_sizes_per_token: np.ndarray = []
+        self.tensor_block_sizes: np.ndarray = []
+        self.full_shard_id = 0
+
         self._build_layout()
 
     @staticmethod
@@ -1575,87 +1577,79 @@ class KVCacheLayerwiseGroupLayout:
     def _build_layout(self) -> None:
         """Flatten registered KV tensors into store-compatible pointer rows."""
 
+        num_shards = len(set(self.layer_id2shard_id.values()))
+        shard_tensor_names = {shard_id: [] for shard_id in range(num_shards)}
+        for layer_name, kv_layer in self.kvcaches.items():
+            layer_id = extract_layer_index(layer_name)
+            tensor_name = layer_name.split(str(layer_id))[-1]
+            shard_tensor_names[self.layer_id2shard_id.get(layer_id)].append(tensor_name)
+        max_num_tensors_per_shard = max(len(tensor_names) for tensor_names in shard_tensor_names.values())
+        partial_shard_ids = []
+        for shard_id, tensor_names in shard_tensor_names.items():
+            if len(tensor_names) < max_num_tensors_per_shard:
+                logger.info_once(f"Shard {shard_id} has only {len(tensor_names)} tensors, ")
+                partial_shard_ids.append(shard_id)
+            else:
+                self.full_shard_id = shard_id
+        full_shard_tensor_names = shard_tensor_names[self.full_shard_id]
+        self.base_ptrs = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.block_strides = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.tensor_token_strides = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.tensor_sizes_per_token = np.array([0] * max_num_tensors_per_shard)
+        self.tensor_block_sizes = np.array([0] * max_num_tensors_per_shard)
+        
         def handle_tensor(
             t: torch.Tensor,
             size_dims: Sequence[int],
             layer_name: str,
             shard_id: int,
+            tensor_id: int,
         ) -> None:
-            self.base_ptrs[shard_id].append(t[0].data_ptr())
-            self.block_strides[shard_id].append(t.stride(0) * t.element_size())
+            self.base_ptrs[shard_id][tensor_id] = t[0].data_ptr()
+            self.block_strides[shard_id][tensor_id] = t.stride(0) * t.element_size()
             tensor_size = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
             token_dim = 1
-            tensor_block_size = int(t.shape[token_dim])
-            self.tensor_token_strides[shard_id].append(
+            self.tensor_token_strides[shard_id][tensor_id] = (
                 t.stride(token_dim) * t.element_size()
             )
-            self.tensor_sizes_per_token[shard_id].append(tensor_size // tensor_block_size)
-            self.tensor_block_sizes[shard_id].append(tensor_block_size)
+            tensor_block_size = int(t.shape[token_dim])
+            if shard_id == self.full_shard_id:
+                self.tensor_sizes_per_token[tensor_id] = tensor_size // tensor_block_size
+                self.tensor_block_sizes[tensor_id] = tensor_block_size
 
         def handle_kv_layer_tensor(
-            tensor: torch.Tensor, layer_name: str, shard_id: int
+            tensor: torch.Tensor, layer_name: str, shard_id: int, tensor_id: int
         ) -> None:
-            if tensor.dim() == 5:
-                # [2, num_blocks, block_size, num_head, head_dim]
-                handle_tensor(tensor[0], (-3, -2, -1), layer_name, shard_id)
-                handle_tensor(tensor[1], (-3, -2, -1), layer_name, shard_id)
-            elif tensor.dim() == 4:
-                if tensor.shape[1] == 2:
-                    # GPU kernels may register [num_blocks, 2, block_size, ...];
-                    # split the K/V axis before reading the token dimension.
-                    handle_tensor(tensor[:, 0], (-2, -1), layer_name, shard_id)
-                    handle_tensor(tensor[:, 1], (-2, -1), layer_name, shard_id)
-                else:
-                    # Ascend registers split KV/state tensors as
-                    # [num_blocks, block_size, num_head, head_dim].
-                    handle_tensor(tensor, (-3, -2, -1), layer_name, shard_id)
+            if tensor.dim() == 4:
+                # [num_blocks, block_size, num_head, head_dim].
+                handle_tensor(tensor, (-3, -2, -1), layer_name, shard_id, tensor_id)
             elif tensor.dim() == 3:
                 # [num_blocks, block_size, head_dim]. Some DeepSeek V4 caches
                 # use block_size=2 here and share a group with larger pages.
-                handle_tensor(tensor, (-2, -1), layer_name, shard_id)
+                handle_tensor(tensor, (-2, -1), layer_name, shard_id, tensor_id)
             else:
                 raise ValueError(
                     f"Unsupported KV cache tensor shape for "
                     f"{layer_name}: {tensor.shape}"
                 )
-
+        
         for layer_name, kv_layer in self.kvcaches.items():
             layer_id = extract_layer_index(layer_name)
             shard_id = self.layer_id2shard_id.get(layer_id)
             if shard_id is None:
-                continue
-            if shard_id not in self.base_ptrs:
-                self.base_ptrs[shard_id] = []
-                self.block_strides[shard_id] = []
-                self.tensor_token_strides[shard_id] = []
-                self.tensor_sizes_per_token[shard_id] = []
-                self.tensor_block_sizes[shard_id] = []
+                raise ValueError(f"Layer {layer_id} in {layer_name} is not assigned to any shard.")
+            tensor_name = layer_name.split(str(layer_id))[-1]
+            tensor_id = full_shard_tensor_names.index(tensor_name)
             if isinstance(kv_layer, torch.Tensor):
-                handle_kv_layer_tensor(kv_layer, layer_name, shard_id)
+                handle_kv_layer_tensor(kv_layer, layer_name, shard_id, tensor_id)
             elif isinstance(kv_layer, Tuple):
                 for tensor in kv_layer:
-                    handle_kv_layer_tensor(tensor, layer_name, shard_id)
+                    handle_kv_layer_tensor(tensor, layer_name, shard_id, tensor_id)
             else:
                 raise TypeError(
                     f"Unsupported KV cache type for " f"{layer_name}: {type(kv_layer)}"
                 )
 
-        for shard_id in self.base_ptrs.keys():
-            self.base_ptrs[shard_id] = np.asarray(
-                self.base_ptrs[shard_id], dtype=np.uint64
-            )
-            self.block_strides[shard_id] = np.asarray(
-                self.block_strides[shard_id], dtype=np.uint64
-            )
-            self.tensor_token_strides[shard_id] = np.asarray(
-                self.tensor_token_strides[shard_id], dtype=np.uint64
-            )
-            self.tensor_sizes_per_token[shard_id] = np.asarray(
-                self.tensor_sizes_per_token[shard_id], dtype=np.uint64
-            )
-            self.tensor_block_sizes[shard_id] = np.asarray(
-                self.tensor_block_sizes[shard_id], dtype=np.uint64
-            )
         logger.info_once(
             f"Built KV cache group layout with layer_id2shard_id: {self.layer_id2shard_id}, "
             f"base_ptrs: {self.base_ptrs}, block_strides: {self.block_strides}, "
@@ -1675,7 +1669,7 @@ class KVCacheLayerwiseGroupLayout:
 
         physical_token_offsets = (
             offsets[:, None]
-            * self.tensor_block_sizes[shard_id][None, :]
+            * self.tensor_block_sizes[None, :]
             // group_token_block_size
         )
 
@@ -1706,9 +1700,9 @@ class KVCacheLayerwiseGroupLayout:
         """Return byte sizes for one logical segment across all tensor views."""
 
         tensor_tokens = (
-            self.tensor_block_sizes[shard_id] * logical_tokens // group_token_block_size
+            self.tensor_block_sizes * logical_tokens // group_token_block_size
         )
-        return (self.tensor_sizes_per_token[shard_id] * tensor_tokens).tolist()
+        return (self.tensor_sizes_per_token * tensor_tokens).tolist()
 
 
 
@@ -1732,7 +1726,6 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
         self.need_load = False
         self.is_save = False
         self.layer_ids: list[int] = []
-        self.layerwise_group_tensor_size_lists: dict[int, list[int]] = {}
         self._failure_req_ids: set[str] = set()
 
 
@@ -1754,7 +1747,7 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
         }
         self.wa_dump_layer_ids = [1]
         self.fa_dump_layer_ids = []
-        wa_shard_idx = 1
+        wa_shard_id = 1
 
         # for DSV4 Pro
         if layer_compress_ratios[0] == 128:
@@ -1763,27 +1756,27 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
                 1: 1,
             }
             self.fa_dump_layer_ids.append(1)
-            fa_shard_idx = 2
+            fa_shard_id = 2
         else:
             # for DSV4 Flash
             self.fa_layer_id2shard_id = {}
-            fa_shard_idx = 0
+            fa_shard_id = 0
             
         for layer_id in range(2, len(layer_compress_ratios), 2):
-            self.wa_layer_id2shard_id[layer_id] = wa_shard_idx
-            self.wa_layer_id2shard_id[layer_id + 1] = wa_shard_idx
-            self.fa_layer_id2shard_id[layer_id] = fa_shard_idx
-            self.fa_layer_id2shard_id[layer_id + 1] = fa_shard_idx
+            self.wa_layer_id2shard_id[layer_id] = wa_shard_id
+            self.wa_layer_id2shard_id[layer_id + 1] = wa_shard_id
+            self.fa_layer_id2shard_id[layer_id] = fa_shard_id
+            self.fa_layer_id2shard_id[layer_id + 1] = fa_shard_id
             self.fa_dump_layer_ids.append(layer_id + 1)
             self.wa_dump_layer_ids.append(layer_id + 1)
-            wa_shard_idx += 1
-            fa_shard_idx += 1
+            wa_shard_id += 1
+            fa_shard_id += 1
         
         if self._vllm_config.speculative_config is not None and self._vllm_config.speculative_config.num_speculative_tokens > 0:
             self.fa_dump_layer_ids[-1] = self.fa_dump_layer_ids[-1] - 1
             self.wa_dump_layer_ids[-1] = self.wa_dump_layer_ids[-1] - 1
-        self.fa_shard_num = fa_shard_idx
-        self.wa_shard_num = wa_shard_idx
+        self.fa_shard_num = fa_shard_id
+        self.wa_shard_num = wa_shard_id
         logger.info(
             f"FA shard num: {self.fa_shard_num}, layer to shard id: {self.fa_layer_id2shard_id}"
         )
@@ -1932,25 +1925,15 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
             if not meta.tail_tokens:
                 continue
             segment_tokens = meta.tail_tokens // meta.tail_blocks
-            shard_tensor_size_lists: list[list[int]] = []
-            for shard_id in sorted(layout.tensor_block_sizes):
-                if len(layout.tensor_block_sizes[shard_id]) == 0:
-                    continue
-                group_tensor_size_list: list[int] = []
-                for _ in range(meta.tail_blocks):
-                    group_tensor_size_list.extend(
-                        layout.segment_tensor_size_list(
-                            segment_tokens,
-                            meta.token_block_size,
-                            shard_id,
-                        )
+            group_tensor_size_list: list[int] = []
+            for _ in range(meta.tail_blocks):
+                group_tensor_size_list.extend(
+                    layout.segment_tensor_size_list(
+                        segment_tokens,
+                        meta.token_block_size,
                     )
-                if group_tensor_size_list:
-                    shard_tensor_size_lists.append(group_tensor_size_list)
-            if shard_tensor_size_lists:
-                group_tensor_size_list = max(shard_tensor_size_lists, key=len)
-                self.layerwise_group_tensor_size_lists[group_id] = group_tensor_size_list
-                tensor_size_list.extend(group_tensor_size_list)
+                )
+            tensor_size_list.extend(group_tensor_size_list)
         if not tensor_size_list:
             group_label = (
                 "FA"
@@ -1966,17 +1949,11 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
         hash_start,
         hash_end,
         candidate_vllm_ids,
-        shard_id: Optional[int] = None,
+        shard_id: int,
     ):
         all_ptrs = []
         for group_id in self.fa_group_ids:
             layout = self.group_layouts.get(group_id)
-            tensor_size_list = self.layerwise_group_tensor_size_lists.get(group_id, [])
-            if shard_id not in layout.base_ptrs:
-                all_ptrs.append(
-                    np.zeros((len(store_keys), len(tensor_size_list)), dtype=np.uint64)
-                )
-                continue
             meta = self.group_metas[group_id]
             block_ids = np.asarray(candidate_vllm_ids[group_id], dtype=np.uint64)
             if self.hash_block_size == meta.token_block_size:
@@ -1991,17 +1968,11 @@ class UCMFAWALayerwiseConnector(UCMFAWAConnector):
 
         return np.concatenate(all_ptrs, axis=1)
 
-    def _extract_wa_ptr(self, store_keys, vllm_ids, shard_id: Optional[int] = None):
+    def _extract_wa_ptr(self, store_keys, vllm_ids, shard_id: int):
 
         all_ptrs = []
         for group_id in self.window_group_ids:
             layout = self.group_layouts.get(group_id)
-            tensor_size_list = self.layerwise_group_tensor_size_lists.get(group_id, [])
-            if shard_id not in layout.base_ptrs:
-                all_ptrs.append(
-                    np.zeros((len(store_keys), len(tensor_size_list)), dtype=np.uint64)
-                )
-                continue
             meta = self.group_metas[group_id]
             if not meta.tail_tokens:
                 continue
