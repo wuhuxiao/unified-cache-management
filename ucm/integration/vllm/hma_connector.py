@@ -1440,3 +1440,690 @@ class UCMFAWAConnector(UCMDirectConnector, SupportsHMA):
     ) -> tuple[bool, dict[str, object] | None]:
         # Scheduler side method
         return True, None
+
+class KVCacheLayerwiseGroupLayout:
+    """Flat pointer layout for one vLLM KV cache group.
+
+    The cache views belonging to one KV group are not necessarily contiguous by
+    layer id, so this layout flattens all registered tensors in a deterministic
+    order and records enough stride metadata to address arbitrary block rows.
+    """
+
+    def __init__(
+        self,
+        kvcaches: dict[str, torch.Tensor],
+        layer_id2shard_id: dict[int, int],
+    ) -> None:
+        self.kvcaches = dict(sorted(kvcaches.items(), key=self._sort_key))
+        self.layer_id2shard_id = layer_id2shard_id
+        self.base_ptrs: list[np.ndarray] = []
+        self.block_strides: list[np.ndarray] = []
+        self.tensor_token_strides: list[np.ndarray] = []
+        self.tensor_sizes_per_token: np.ndarray = []
+        self.tensor_block_sizes: np.ndarray = []
+        self.full_shard_id = 0
+
+        self._build_layout()
+
+    @staticmethod
+    def _sort_key(item: tuple[str, torch.Tensor]) -> tuple[int, str]:
+        name, _ = item
+        return (extract_layer_index(name), name)
+
+    def _build_layout(self) -> None:
+        """Flatten registered KV tensors into store-compatible pointer rows."""
+
+        num_shards = len(set(self.layer_id2shard_id.values()))
+        shard_tensor_names = {shard_id: [] for shard_id in range(num_shards)}
+        for layer_name, kv_layer in self.kvcaches.items():
+            layer_id = extract_layer_index(layer_name)
+            tensor_name = layer_name.split(str(layer_id))[-1]
+            shard_tensor_names[self.layer_id2shard_id.get(layer_id)].append(tensor_name)
+        max_num_tensors_per_shard = max(len(tensor_names) for tensor_names in shard_tensor_names.values())
+        partial_shard_ids = []
+        for shard_id, tensor_names in shard_tensor_names.items():
+            if len(tensor_names) < max_num_tensors_per_shard:
+                logger.info_once(f"Shard {shard_id} has only {len(tensor_names)} tensors, ")
+                partial_shard_ids.append(shard_id)
+            else:
+                self.full_shard_id = shard_id
+        full_shard_tensor_names = shard_tensor_names[self.full_shard_id]
+        self.base_ptrs = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.block_strides = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.tensor_token_strides = [np.array([0] * max_num_tensors_per_shard) for _ in range(num_shards)]
+        self.tensor_sizes_per_token = np.array([0] * max_num_tensors_per_shard)
+        self.tensor_block_sizes = np.array([0] * max_num_tensors_per_shard)
+        
+        def handle_tensor(
+            t: torch.Tensor,
+            size_dims: Sequence[int],
+            layer_name: str,
+            shard_id: int,
+            tensor_id: int,
+        ) -> None:
+            self.base_ptrs[shard_id][tensor_id] = t[0].data_ptr()
+            self.block_strides[shard_id][tensor_id] = t.stride(0) * t.element_size()
+            tensor_size = math.prod([t.shape[i] for i in size_dims]) * t.element_size()
+            token_dim = 1
+            self.tensor_token_strides[shard_id][tensor_id] = (
+                t.stride(token_dim) * t.element_size()
+            )
+            tensor_block_size = int(t.shape[token_dim])
+            if shard_id == self.full_shard_id:
+                self.tensor_sizes_per_token[tensor_id] = tensor_size // tensor_block_size
+                self.tensor_block_sizes[tensor_id] = tensor_block_size
+
+        def handle_kv_layer_tensor(
+            tensor: torch.Tensor, layer_name: str, shard_id: int, tensor_id: int
+        ) -> None:
+            if tensor.dim() == 4:
+                # [num_blocks, block_size, num_head, head_dim].
+                handle_tensor(tensor, (-3, -2, -1), layer_name, shard_id, tensor_id)
+            elif tensor.dim() == 3:
+                # [num_blocks, block_size, head_dim]. Some DeepSeek V4 caches
+                # use block_size=2 here and share a group with larger pages.
+                handle_tensor(tensor, (-2, -1), layer_name, shard_id, tensor_id)
+            else:
+                raise ValueError(
+                    f"Unsupported KV cache tensor shape for "
+                    f"{layer_name}: {tensor.shape}"
+                )
+        
+        for layer_name, kv_layer in self.kvcaches.items():
+            layer_id = extract_layer_index(layer_name)
+            shard_id = self.layer_id2shard_id.get(layer_id)
+            if shard_id is None:
+                raise ValueError(f"Layer {layer_id} in {layer_name} is not assigned to any shard.")
+            tensor_name = layer_name.split(str(layer_id))[-1]
+            tensor_id = full_shard_tensor_names.index(tensor_name)
+            if isinstance(kv_layer, torch.Tensor):
+                handle_kv_layer_tensor(kv_layer, layer_name, shard_id, tensor_id)
+            elif isinstance(kv_layer, Tuple):
+                for tensor in kv_layer:
+                    handle_kv_layer_tensor(tensor, layer_name, shard_id, tensor_id)
+            else:
+                raise TypeError(
+                    f"Unsupported KV cache type for " f"{layer_name}: {type(kv_layer)}"
+                )
+
+        logger.info_once(
+            f"Built KV cache group layout with layer_id2shard_id: {self.layer_id2shard_id}, "
+            f"base_ptrs: {self.base_ptrs}, block_strides: {self.block_strides}, "
+            f"tensor_token_strides: {self.tensor_token_strides}, "
+            f"tensor_sizes_per_token: {self.tensor_sizes_per_token}, "
+            f"tensor_block_sizes: {self.tensor_block_sizes}"
+        )
+
+    def extract_addrs_with_offsets(
+        self,
+        block_ids: np.ndarray,
+        group_token_block_size: int,
+        offsets: np.ndarray,
+        shard_id: int,
+    ) -> np.ndarray:
+        """Return per-view addresses for logical blocks with token offsets."""
+
+        physical_token_offsets = (
+            offsets[:, None]
+            * self.tensor_block_sizes[None, :]
+            // group_token_block_size
+        )
+
+        return (
+            block_ids[:, None] * self.block_strides[shard_id][None, :]
+            + physical_token_offsets * self.tensor_token_strides[shard_id][None, :]
+            + self.base_ptrs[shard_id][None, :]
+        ).astype(np.uint64, copy=False)
+
+    def extract_addrs(
+        self,
+        block_ids: np.ndarray,
+        shard_id: int,
+    ) -> np.ndarray:
+        """Return per-view base addresses for complete tensor blocks."""
+
+        return (
+            block_ids[:, None] * self.block_strides[shard_id][None, :]
+            + self.base_ptrs[shard_id][None, :]
+        ).astype(np.uint64, copy=False)
+
+    def segment_tensor_size_list(
+        self,
+        logical_tokens: int,
+        group_token_block_size: int,
+        shard_id: int = 0,
+    ) -> list[int]:
+        """Return byte sizes for one logical segment across all tensor views."""
+
+        tensor_tokens = (
+            self.tensor_block_sizes * logical_tokens // group_token_block_size
+        )
+        return (self.tensor_sizes_per_token * tensor_tokens).tolist()
+
+
+
+class UCMFAWALayerwiseConnector(UCMFAWAConnector):
+
+    DEFAULT_HASH_BLOCK_SIZE = 256
+    ASCEND_DEFAULT_HASH_BLOCK_SIZE = 512
+
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        role: KVConnectorRole,
+        kv_cache_config: "KVCacheConfig",
+    ):
+        super().__init__(vllm_config, role, kv_cache_config)
+        self._get_layer_id2shard_id()
+
+        self.load_tasks: dict[tuple[str, int], list[FAWALoadTask]] = {}
+        self.dump_tasks: list[FAWADumpTask] = []
+        self.submitted_load_shards: set[tuple[str, int]] = set()
+        self.need_load = False
+        self.is_save = False
+        self.layer_ids: list[int] = []
+        self._failure_req_ids: set[str] = set()
+
+
+    def _get_layer_id2shard_id(self) -> None:
+        layer_compress_ratios = getattr(
+            self._vllm_config.model_config.hf_config,
+            "compress_ratios",
+            None,
+        )
+        assert layer_compress_ratios is not None, "Layer-wise FA/WA store sharding requires compress_ratios in model config."
+        assert len(layer_compress_ratios) % 2 == 0, "Layer-wise FA/WA store sharding requires compress_ratios to be even."
+        self.fa_layer_id2shard_id = {
+            0: 0,
+            1: 0,
+        }
+        self.wa_layer_id2shard_id = {
+            0: 0,
+            1: 0,
+        }
+        self.wa_dump_layer_ids = [1]
+        self.fa_dump_layer_ids = []
+        wa_shard_id = 1
+
+        # for DSV4 Pro
+        if layer_compress_ratios[0] == 128:
+            self.fa_layer_id2shard_id = {
+                0: 0,
+                1: 1,
+            }
+            self.fa_dump_layer_ids.append(1)
+            fa_shard_id = 2
+        else:
+            # for DSV4 Flash
+            self.fa_layer_id2shard_id = {}
+            fa_shard_id = 0
+            
+        for layer_id in range(2, len(layer_compress_ratios), 2):
+            self.wa_layer_id2shard_id[layer_id] = wa_shard_id
+            self.wa_layer_id2shard_id[layer_id + 1] = wa_shard_id
+            self.fa_layer_id2shard_id[layer_id] = fa_shard_id
+            self.fa_layer_id2shard_id[layer_id + 1] = fa_shard_id
+            self.fa_dump_layer_ids.append(layer_id + 1)
+            self.wa_dump_layer_ids.append(layer_id + 1)
+            wa_shard_id += 1
+            fa_shard_id += 1
+        
+        if self._vllm_config.speculative_config is not None and self._vllm_config.speculative_config.num_speculative_tokens > 0:
+            self.fa_dump_layer_ids[-1] = self.fa_dump_layer_ids[-1] - 1
+            self.wa_dump_layer_ids[-1] = self.wa_dump_layer_ids[-1] - 1
+        self.fa_shard_num = fa_shard_id
+        self.wa_shard_num = wa_shard_id
+        logger.info(
+            f"FA shard num: {self.fa_shard_num}, layer to shard id: {self.fa_layer_id2shard_id}"
+        )
+        logger.info(
+            f"WA shard num: {self.wa_shard_num}, layer to shard id: {self.wa_layer_id2shard_id}"
+        )
+
+    def _create_fa_store(
+        self,
+        group_layouts: Optional[dict[int, KVCacheGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        """Create the backing store used for full-attention rows."""
+
+        tensor_size_list = None
+        if self._role == KVConnectorRole.WORKER:
+            if group_layouts is None:
+                raise RuntimeError("Worker FA store needs layouts.")
+            tensor_size_list = self._store_tensor_size_list(
+                group_layouts,
+                self.fa_group_ids,
+            )
+            return self._create_layerwise_store(
+                "FA", "fa", tensor_size_list, self.fa_shard_num, cpu_affinity_cores
+            )
+        return super()._create_fa_store(group_layouts, cpu_affinity_cores)
+
+    def _create_wa_store(
+        self,
+        group_layouts: Optional[dict[int, KVCacheGroupLayout]],
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        """Create the backing store used for window-tail rows."""
+
+        tensor_size_list = None
+        if self._role == KVConnectorRole.WORKER:
+            if group_layouts is None:
+                raise RuntimeError("Worker WA store needs layouts.")
+            tensor_size_list = self._store_tensor_size_list(
+                group_layouts,
+                self.window_group_ids,
+            )
+            return self._create_layerwise_store(
+                "WA", "wa", tensor_size_list, self.wa_shard_num, cpu_affinity_cores
+            )
+        return super()._create_wa_store(group_layouts, cpu_affinity_cores)
+
+    def _create_layerwise_store(
+        self,
+        label: str,
+        store_suffix: str,
+        tensor_size_list: list[int],
+        shard_num: int,
+        cpu_affinity_cores: Optional[list[int]] = None,
+    ) -> UcmKVStoreBaseV1:
+        name, module_path, config = self._base_store_config(store_suffix)
+        config["device_id"] = self.local_rank
+        config["tensor_size_list"] = tensor_size_list
+        aligned_size = 4096
+        padded_size = round_up(sum(tensor_size_list), aligned_size)
+        config["shard_size"] = padded_size
+        config["block_size"] = padded_size * max(shard_num, 1)
+        config["local_rank_size"] = self.tp_size if self.is_mla else 1
+        if cpu_affinity_cores:
+            config["cpu_affinity_cores"] = list(cpu_affinity_cores)
+        logger.info(
+            f"create FAWA layerwise {label} {name} with config: "
+            f"{self._summarize_store_config(config)}"
+        )
+        return UcmConnectorFactoryV1.create_connector(name, config, module_path)
+
+
+    def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
+        """Register worker KV tensors and create FA/WA stores with layouts."""
+
+        self.kv_caches = kv_caches
+        self.device = create_device()
+
+        enable_affinity = os.getenv("VLLM_CPU_AFFINITY") == "1"
+        worker_cores, store_cores = (
+            self.device.split_cores(self.local_rank)
+            if enable_affinity
+            else (None, None)
+        )
+
+        if self.is_ascend_layout:
+            # Ascend may provide multiple tensors for the same layer name; each
+            # KV group consumes its slice in vllm-ascend registration order.
+            next_tensor_index_by_layer: dict[str, int] = {}
+            for group_id, group in enumerate(self._kv_cache_config.kv_cache_groups):
+                kv_cache_spec_name = type(group.kv_cache_spec).__name__
+                group_caches: dict[str, torch.Tensor] = {}
+                for layer_name in group.layer_names:
+                    tensor_count = 2 if kv_cache_spec_name == "C4IndexerSpec" else 1
+                    start = next_tensor_index_by_layer.get(layer_name, 0)
+                    end = start + tensor_count
+                    next_tensor_index_by_layer[layer_name] = end
+                    group_caches[layer_name] = tuple(kv_caches[layer_name][start:end])
+
+                layer_id2shard_id = {}
+                if group_id in self.fa_group_ids:
+                    layer_id2shard_id = self.fa_layer_id2shard_id
+                else:
+                    layer_id2shard_id = self.wa_layer_id2shard_id
+                    
+                layout = KVCacheLayerwiseGroupLayout(group_caches, layer_id2shard_id)
+                self.group_layouts[group_id] = layout
+        else:
+            for group_id, group_spec in enumerate(
+                self._kv_cache_config.kv_cache_groups
+            ):
+                group_caches: dict[str, torch.Tensor] = {}
+                for layer_name in group_spec.layer_names:
+                    group_caches[layer_name] = kv_caches[layer_name]
+                if group_id in self.fa_group_ids:
+                    layer_id2shard_id = self.fa_layer_id2shard_id
+                else:
+                    layer_id2shard_id = self.wa_layer_id2shard_id
+                layout = KVCacheLayerwiseGroupLayout(group_caches, layer_id2shard_id)
+                self.group_layouts[group_id] = layout
+
+        self.layer_ids = sorted({extract_layer_index(name) for name in kv_caches})
+
+        self.store = self._create_fa_store(self.group_layouts, store_cores)
+        self.fa_store = self.store
+        self.wa_store = self._create_wa_store(self.group_layouts, store_cores)
+
+        if worker_cores:
+            try:
+                os.sched_setaffinity(0, worker_cores)
+                logger.info(f"[VLLM CPU Affinity] Worker bound to cores {worker_cores}")
+            except Exception as e:
+                logger.warning(f"Failed to bind worker: {e}")
+
+    def _store_tensor_size_list(
+        self,
+        group_layouts: dict[int, KVCacheLayerwiseGroupLayout],
+        group_ids: tuple[int, ...],
+    ) -> list[int]:
+        tensor_size_list: list[int] = []
+        for group_id in group_ids:
+            layout = group_layouts.get(group_id)
+            if layout is None:
+                continue
+            meta = self.group_metas[group_id]
+            if not meta.tail_tokens:
+                continue
+            segment_tokens = meta.tail_tokens // meta.tail_blocks
+            group_tensor_size_list: list[int] = []
+            for _ in range(meta.tail_blocks):
+                group_tensor_size_list.extend(
+                    layout.segment_tensor_size_list(
+                        segment_tokens,
+                        meta.token_block_size,
+                    )
+                )
+            tensor_size_list.extend(group_tensor_size_list)
+        if not tensor_size_list:
+            group_label = (
+                "FA"
+                if group_ids == self.fa_group_ids
+                else "WA" if group_ids == self.window_group_ids else str(group_ids)
+            )
+            raise RuntimeError(f"Worker FAWA layerwise {group_label} layout is empty.")
+        return tensor_size_list
+
+    def _extract_fa_ptr(
+        self,
+        store_keys,
+        hash_start,
+        hash_end,
+        candidate_vllm_ids,
+        shard_id: int,
+    ):
+        all_ptrs = []
+        for group_id in self.fa_group_ids:
+            layout = self.group_layouts.get(group_id)
+            meta = self.group_metas[group_id]
+            block_ids = np.asarray(candidate_vllm_ids[group_id], dtype=np.uint64)
+            if self.hash_block_size == meta.token_block_size:
+                group_ptrs = layout.extract_addrs(block_ids, shard_id)
+            else:
+                token_start = np.arange(hash_start, hash_end) * self.hash_block_size
+                token_offsets = token_start % meta.token_block_size
+                group_ptrs = layout.extract_addrs_with_offsets(
+                    block_ids, meta.token_block_size, token_offsets, shard_id
+                )
+            all_ptrs.append(group_ptrs)
+
+        return np.concatenate(all_ptrs, axis=1)
+
+    def _extract_wa_ptr(self, store_keys, vllm_ids, shard_id: int):
+
+        all_ptrs = []
+        for group_id in self.window_group_ids:
+            layout = self.group_layouts.get(group_id)
+            meta = self.group_metas[group_id]
+            if not meta.tail_tokens:
+                continue
+
+            block_ids = np.asarray(vllm_ids[group_id], dtype=np.uint64)
+            if meta.tail_blocks == 1 and meta.token_block_size > meta.tail_tokens:
+                token_offsets = np.ones_like(block_ids) * (
+                    meta.token_block_size - meta.tail_tokens
+                )
+                group_ptrs = layout.extract_addrs_with_offsets(
+                    block_ids, meta.token_block_size, token_offsets, shard_id
+                )
+            else:
+                group_ptrs = layout.extract_addrs(block_ids, shard_id)
+                group_ptrs = group_ptrs.reshape(len(store_keys), -1)
+
+            all_ptrs.append(group_ptrs)
+
+        return np.concatenate(all_ptrs, axis=1)
+
+    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+        
+        self.load_tasks.clear()
+        self.submitted_load_shards.clear()
+        self._failure_req_ids.clear()
+        self.need_load = False
+
+        if not any(request.load_keys for request in metadata.request_meta.values()):
+            return
+
+        self.need_load = True
+        # TODO: not support pipeline parallel for now
+        first_layer_id = 0
+        for label, shard_id, store in (
+            ("FA", self.fa_layer_id2shard_id.get(first_layer_id), self.fa_store),
+            ("WA", self.wa_layer_id2shard_id.get(first_layer_id), self.wa_store),
+        ):
+            if shard_id is not None:
+                self._submit_load_shard(label, shard_id, metadata, store)
+
+    def _submit_load_shard(
+        self,
+        label: str,
+        shard_id: int,
+        metadata: UCMFAWAConnectorMetadata,
+        store: UcmKVStoreBaseV1,
+    ) -> None:
+        shard_key = (label, shard_id)
+        if shard_key in self.submitted_load_shards:
+            return
+        self.submitted_load_shards.add(shard_key)
+
+        tasks: list[FAWALoadTask] = []
+        for request_id, request in metadata.request_meta.items():
+            if not request.load_keys or request_id in self._failure_req_ids:
+                continue
+            group0_vllm_block_ids = set(request.load_vllm_block_ids[0])
+            try:
+                if label == "FA":
+                    keys = request.load_keys
+                    ptrs = self._extract_fa_ptr(
+                        keys,
+                        request.load_hash_start,
+                        request.load_hash_end,
+                        request.load_vllm_block_ids,
+                        shard_id,
+                    )
+                else:
+                    keys = request.load_keys[-1:]
+                    ptrs = self._extract_wa_ptr(
+                        keys,
+                        request.load_vllm_block_ids,
+                        shard_id,
+                    )
+                task = store.load_data(keys, [shard_id] * len(keys), ptrs)
+                tasks.append(
+                    FAWALoadTask(
+                        request_id,
+                        f"{label}:{shard_id}",
+                        store,
+                        task,
+                        len(keys),
+                        group0_vllm_block_ids,
+                    )
+                )
+            except Exception as e:
+                logger.error(
+                    f"request {request_id} submit FAWA layerwise load task "
+                    f"label={label}, shard={shard_id} error. {type(e).__name__}: {e}"
+                )
+                self._invalid_block_ids.update(group0_vllm_block_ids)
+                self._failure_req_ids.add(request_id)
+        if tasks:
+            self.load_tasks[shard_key] = tasks
+
+    def wait_for_layer_load(self, layer_name: str) -> None:
+        if not self._connector_metadata:
+            return
+        if not self.need_load:
+            return
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+        layer_id = extract_layer_index(layer_name)
+
+        # first lanch next layer load tasks
+        next_layer_id = layer_id + 1
+        for label, shard_id, store in (
+            ("FA", self.fa_layer_id2shard_id.get(next_layer_id), self.fa_store),
+            ("WA", self.wa_layer_id2shard_id.get(next_layer_id), self.wa_store),
+        ):
+            if shard_id is not None:
+                self._submit_load_shard(label, shard_id, metadata, store)
+        # then wait for current layer load tasks to complete, so that load and compute can be better overlapped
+        for label, shard_id in (
+            ("FA", self.fa_layer_id2shard_id.get(layer_id)),
+            ("WA", self.wa_layer_id2shard_id.get(layer_id)),
+        ):
+            if shard_id is None:
+                continue
+            for load_task in self.load_tasks.pop((label, shard_id), []):
+                self._wait_load_task(load_task)
+
+    def save_kv_layer(
+        self,
+        layer_name: str,
+        kv_layer: torch.Tensor,
+        attn_metadata: "AttentionMetadata",
+        **kwargs,
+    ) -> None:
+        if not self._connector_metadata:
+            return
+
+        metadata = self._get_connector_metadata()
+        if not isinstance(metadata, UCMFAWAConnectorMetadata):
+            raise RuntimeError(f"Unexpected FAWA metadata type: {type(metadata)}")
+        
+        layer_id = extract_layer_index(layer_name)
+
+        for label, shard_id, dump_layer_ids,store in (
+            ("FA", self.fa_layer_id2shard_id.get(layer_id), self.fa_dump_layer_ids, self.fa_store),
+            ("WA", self.wa_layer_id2shard_id.get(layer_id), self.wa_dump_layer_ids, self.wa_store),
+        ):
+            if layer_id not in dump_layer_ids:
+                continue
+            
+            dump_keys: list[bytes] = []
+            ptr_rows: list[np.ndarray] = []
+            wa_dump_ring_idx = 0
+            for _, request in metadata.request_meta.items():
+                if not request.dump_keys:
+                    continue
+                if label == "FA":
+                    num_keys = len(request.dump_keys)
+                    tp_block_start = num_keys * self.tp_rank // self.tp_size
+                    tp_block_end = num_keys * (self.tp_rank + 1) // self.tp_size
+                    keys = request.dump_keys[tp_block_start:tp_block_end]
+                    if not keys:
+                        continue
+                    vllm_block_ids = tuple(
+                        (
+                            group_block_ids[tp_block_start:tp_block_end]
+                            if group_id in self.fa_group_ids
+                            else group_block_ids
+                        )
+                        for group_id, group_block_ids in enumerate(
+                            request.dump_vllm_block_ids
+                        )
+                    )
+                    ptrs = self._extract_fa_ptr(
+                        keys,
+                        request.dump_hash_start + tp_block_start,
+                        request.dump_hash_start + tp_block_end,
+                        vllm_block_ids,
+                        shard_id,
+                    )
+                elif self.wa_dump_block_wise:
+                    num_keys = len(request.dump_keys)
+                    tp_block_start = num_keys * self.tp_rank // self.tp_size
+                    tp_block_end = num_keys * (self.tp_rank + 1) // self.tp_size
+                    keys = request.dump_keys[tp_block_start:tp_block_end]
+                    if not keys:
+                        continue
+                    vllm_block_ids = tuple(
+                        (
+                            group_block_ids[
+                                tp_block_start
+                                * self.group_metas[
+                                    group_id
+                                ].tail_blocks : tp_block_end
+                                * self.group_metas[group_id].tail_blocks
+                            ]
+                            if group_id in self.window_group_ids
+                            else group_block_ids
+                        )
+                        for group_id, group_block_ids in enumerate(
+                            request.dump_vllm_block_ids
+                        )
+                    )
+                    ptrs = self._extract_wa_ptr(keys, vllm_block_ids, shard_id)
+                else:
+                    if wa_dump_ring_idx % self.tp_size != self.tp_rank:
+                        wa_dump_ring_idx += 1
+                        continue
+                    keys = request.dump_keys[-1:]
+                    ptrs = self._extract_wa_ptr(
+                        keys, request.dump_vllm_block_ids, shard_id
+                    )
+                    wa_dump_ring_idx += 1
+
+                dump_keys.extend(keys)
+                ptr_rows.append(ptrs)
+
+            if dump_keys:
+                event_handle = self._get_dump_event_handle()
+                try:
+                    task = store.dump_data(
+                        dump_keys,
+                        [shard_id] * len(dump_keys),
+                        np.vstack(ptr_rows),
+                        event_handle,
+                    )
+                    self.dump_tasks.append(
+                        FAWADumpTask(
+                            f"{label}:{shard_id}",
+                            store,
+                            task,
+                            len(dump_keys),
+                            event_handle,
+                        )
+                    )
+                    self.is_save = True
+                except Exception as e:
+                    self.device.destroy_event_handle(event_handle)
+                    logger.error(
+                        f"submit FAWA layerwise dump task failed. "
+                        f"label={label}, shard={shard_id}, {type(e).__name__}: {e}"
+                    )
+
+    def wait_for_save(self) -> None:
+        if not self.is_save:
+            return
+        for dump_task in self.dump_tasks:
+            try:
+                dump_task.store.wait(dump_task.task)
+            except Exception as e:
+                logger.error(
+                    "Best-effort FAWA layerwise dump task failed; external cache may miss. "
+                    f"label={dump_task.label}, keys={dump_task.key_count}, "
+                    f"{type(e).__name__}: {e}"
+                )
+        self.dump_tasks.clear()
+        self.is_save = False
+        if self.enable_event_sync:
+            self.device.destroy_event_handles()
